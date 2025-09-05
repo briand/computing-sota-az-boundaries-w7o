@@ -6,8 +6,12 @@ This script creates an interactive map showing SOTA summits and their activation
 Similar to the R Leaflet visualization in the original W7W_LC.Rmd script.
 
 Usage:
-  python visualize_activation_zones.py --region-dir W7O/W7O_NC
-  python visualize_activation_zones.py --region-dir W7W/W7W_LC --output maps/map.html
+  python visualize_activation_zones.py W7O_NC
+  python visualize_activation_zones.py W7O_NC W7O_WV
+  python visualize_activation_zones.py W7W_LC --output maps/map.html
+  
+  # Cross-association combinations
+  python visualize_activation_zones.py W7O/W7O_NC W7W/W7W_LC
 """
 
 import os
@@ -17,6 +21,7 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
+import pandas as pd
 import geopandas as gpd
 import folium
 from folium import plugins
@@ -267,29 +272,31 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Visualize W7O/NC summits and activation zones
-  python visualize_activation_zones.py --region-dir W7O/W7O_NC
+  # Visualize single region
+  python visualize_activation_zones.py W7O_NC
+  
+  # Visualize multiple regions
+  python visualize_activation_zones.py W7O_NC W7O_WV
   
   # Save to custom output file
-  python visualize_activation_zones.py --region-dir W7W/W7W_LC --output maps/w7w_lc_map.html
+  python visualize_activation_zones.py W7W_LC --output maps/w7w_lc_map.html
   
   # Don't auto-open browser
-  python visualize_activation_zones.py --region-dir W7O/W7O_NC --no-open
+  python visualize_activation_zones.py W7O_NC --no-open
         """
     )
     
     parser.add_argument(
-        '--region-dir',
-        type=str,
-        required=True,
-        help='Path to region directory containing input/ and output/ subdirectories'
+        'region_dirs',
+        nargs='+',
+        help='One or more region directory names (e.g., W7O_NC, W7O_WV)'
     )
     
     parser.add_argument(
         '--output',
         type=str,
         default=None,
-        help='Output HTML file path (default: maps/{region}_activation_zones_map.html)'
+        help='Output HTML file path (default: maps/{regions}_activation_zones_map.html)'
     )
     
     parser.add_argument(
@@ -305,47 +312,78 @@ Examples:
     
     setup_logging()
     
-    # Parse region directory
-    region_dir = Path(args.region_dir)
-    if not region_dir.exists():
-        logging.error(f"Region directory not found: {region_dir}")
-        sys.exit(1)
+    # Process all region directories
+    all_summits = []
+    all_activation_zones = []
+    region_names = []
     
-    region_name = region_dir.name
-    input_dir = region_dir / "input"
-    output_dir = region_dir / "output"
+    for region_dir_name in args.region_dirs:
+        region_dir = Path(region_dir_name)
+        if not region_dir.exists():
+            logging.error(f"Region directory not found: {region_dir}")
+            sys.exit(1)
+        
+        region_name = region_dir.name
+        region_names.append(region_name)
+        input_dir = region_dir / "input"
+        output_dir = region_dir / "output"
+        
+        # Find input file
+        input_files = list(input_dir.glob("*.geojson"))
+        if not input_files:
+            logging.error(f"No GeoJSON input files found in {input_dir}")
+            sys.exit(1)
+        
+        input_file = input_files[0]  # Use first one found
+        if len(input_files) > 1:
+            logging.warning(f"Multiple input files found in {region_name}, using: {input_file}")
+        
+        try:
+            # Load data for this region
+            logging.info(f"Processing region: {region_name}")
+            summits_gdf = load_summit_data(input_file)
+            activation_zones_gdf = load_activation_zones(output_dir)
+            
+            # Ensure both datasets are in WGS84
+            if summits_gdf.crs != 'EPSG:4326':
+                summits_gdf = summits_gdf.to_crs('EPSG:4326')
+            if activation_zones_gdf.crs != 'EPSG:4326':
+                activation_zones_gdf = activation_zones_gdf.to_crs('EPSG:4326')
+            
+            # Add region identifier to the data
+            summits_gdf['region'] = region_name
+            activation_zones_gdf['region'] = region_name
+            
+            all_summits.append(summits_gdf)
+            all_activation_zones.append(activation_zones_gdf)
+            
+        except Exception as e:
+            logging.error(f"Error processing region {region_name}: {e}")
+            sys.exit(1)
     
-    # Find input file
-    input_files = list(input_dir.glob("*.geojson"))
-    if not input_files:
-        logging.error(f"No GeoJSON input files found in {input_dir}")
-        sys.exit(1)
-    
-    input_file = input_files[0]  # Use first one found
-    if len(input_files) > 1:
-        logging.warning(f"Multiple input files found, using: {input_file}")
+    # Combine all regions
+    if len(all_summits) > 1:
+        combined_summits = gpd.GeoDataFrame(pd.concat(all_summits, ignore_index=True))
+        combined_activation_zones = gpd.GeoDataFrame(pd.concat(all_activation_zones, ignore_index=True))
+    else:
+        combined_summits = all_summits[0]
+        combined_activation_zones = all_activation_zones[0]
     
     # Determine output file path
     if args.output:
         output_file = Path(args.output)
     else:
-        output_file = Path(f"maps/{region_name.lower()}_activation_zones_map.html")
+        regions_str = "_".join(region_names).lower()
+        output_file = Path(f"maps/{regions_str}_activation_zones_map.html")
+    
+    # Ensure output directory exists
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     
     try:
-        # Load data
-        logging.info(f"Processing region: {region_name}")
-        summits_gdf = load_summit_data(input_file)
-        activation_zones_gdf = load_activation_zones(output_dir)
-        
-        # Ensure both datasets are in WGS84
-        if summits_gdf.crs != 'EPSG:4326':
-            summits_gdf = summits_gdf.to_crs('EPSG:4326')
-        if activation_zones_gdf.crs != 'EPSG:4326':
-            activation_zones_gdf = activation_zones_gdf.to_crs('EPSG:4326')
-        
-        # Create map
-        logging.info("Creating interactive map...")
-        map_obj = create_interactive_map(summits_gdf, activation_zones_gdf, region_name)
+        # Create combined map
+        combined_region_name = " + ".join(region_names)
+        logging.info(f"Creating interactive map for: {combined_region_name}")
+        map_obj = create_interactive_map(combined_summits, combined_activation_zones, combined_region_name)
         
         # Save map
         map_obj.save(str(output_file))
@@ -365,6 +403,4 @@ Examples:
         sys.exit(1)
 
 if __name__ == "__main__":
-    # Import pandas here since it's needed by geopandas
-    import pandas as pd
     main()
