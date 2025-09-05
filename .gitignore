@@ -10,3 +10,4 @@ renv
 __pycache__
 .pytest_cache
 maps
+cache
