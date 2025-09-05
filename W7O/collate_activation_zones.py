@@ -3,7 +3,7 @@
 SOTA Activation Zone Collator
 
 This script collates individual activation zone GeoJSON files from a folder
-into a single combined GeoJSON file, for easier loding into mapping apps like CalTopo or Gaia.
+into a single combined GeoJSON file, for easier loading into mapping apps like CalTopo or Gaia.
 
 Usage:
     python collate_activation_zones.py <folder_path>

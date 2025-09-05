@@ -26,9 +26,10 @@ from datetime import datetime, timezone
 # Configuration
 SOTA_API_BASE = "https://api2.sota.org.uk/api"
 ARCGIS_IMAGESERVER = "https://gis.dogami.oregon.gov/arcgis/rest/services/lidar/DIGITAL_TERRAIN_MODEL_MOSAIC/ImageServer"
-BUFFER_RADIUS_KM = 0.5  # From center to edge of raster tile (500m radius)
+TILE_RADIUS_KM = 0.5  # From center to edge of raster tile (500m radius)
 ACTIVATION_ZONE_HEIGHT_FT = 82
 DEFAULT_ELEVATION_TOLERANCE_FT = 20.0  # Default tolerance for summit vs raster elevation validation
+DEFAULT_ASSOCIATION = "W7O"
 
 # Directory paths will be set dynamically based on association/region
 CACHE_DIR = None
@@ -91,8 +92,7 @@ def setup_logging(log_file: Optional[str] = None, quiet: bool = False):
         log_file: Path to log file (optional)
         quiet: If True and log_file is specified, suppress stdout output
     """
-    log_format = '%(asctime)s - %(levelname)s - %(message)s'
-    console_format = '%(levelname)s - %(message)s'
+    log_format = '%(asctime)s %(levelname)s - %(message)s'
     
     if log_file:
         # Setup file logging
@@ -107,7 +107,7 @@ def setup_logging(log_file: Optional[str] = None, quiet: bool = False):
         if not quiet:
             console = logging.StreamHandler(sys.stdout)
             console.setLevel(logging.INFO)
-            console.setFormatter(logging.Formatter(console_format))
+            console.setFormatter(logging.Formatter(log_format))
             logging.getLogger().addHandler(console)
     else:
         # Standard stdout logging when no file specified
@@ -161,7 +161,7 @@ def calculate_distance_to_edges(contour_coords: List[Tuple[float, float]],
             'right': min_dist_right * meters_per_degree,
             'bottom': min_dist_bottom * 111000,  # Latitude degrees to meters
             'top': min_dist_top * 111000,
-            'overall': min_dist_overall * meters_per_degree
+            'shortest': min_dist_overall * meters_per_degree
         }
     elif is_oregon_lambert_ft:
         # EPSG:6557 uses US Survey Feet - convert to meters
@@ -171,7 +171,7 @@ def calculate_distance_to_edges(contour_coords: List[Tuple[float, float]],
             'right': min_dist_right * feet_to_meters,
             'bottom': min_dist_bottom * feet_to_meters,
             'top': min_dist_top * feet_to_meters,
-            'overall': min_dist_overall * feet_to_meters
+            'shortest': min_dist_overall * feet_to_meters
         }
     else:
         # Assume already in projected meters
@@ -180,8 +180,29 @@ def calculate_distance_to_edges(contour_coords: List[Tuple[float, float]],
             'right': min_dist_right,
             'bottom': min_dist_bottom,
             'top': min_dist_top,
-            'overall': min_dist_overall
+            'shortest': min_dist_overall
         }
+
+def setup_directories_from_input_file(summits_file: Path, output_dir: Optional[str] = None):
+    """Setup directory structure based on input file location or specified output directory"""
+    global CACHE_DIR, INPUT_DIR, OUTPUT_DIR
+    
+    if output_dir:
+        # Use specified output directory as base
+        base_dir = Path(output_dir)
+        logging.info(f"Using specified base directory: {base_dir}")
+    else:
+        # Use the directory containing the summit file as base
+        base_dir = summits_file.parent
+        logging.info(f"Using summit file directory as base: {base_dir}")
+    
+    # Set up directory paths (no input folder needed)
+    CACHE_DIR = base_dir / "cache"
+    OUTPUT_DIR = base_dir / "output"
+    INPUT_DIR = None  # Not needed when processing from file
+    
+    logging.info(f"  Cache: {CACHE_DIR}")
+    logging.info(f"  Output: {OUTPUT_DIR}")
 
 def setup_regional_directories(association: str, region: str):
     """Setup directory structure for association/region"""
@@ -202,12 +223,15 @@ def setup_regional_directories(association: str, region: str):
 
 def ensure_directories():
     """Create cache, input, and output directories if they don't exist"""
-    if CACHE_DIR is None or INPUT_DIR is None or OUTPUT_DIR is None:
-        raise ValueError("Directories not initialized. Call setup_regional_directories() first.")
+    if CACHE_DIR is None or OUTPUT_DIR is None:
+        raise ValueError("Directories not initialized. Call setup_regional_directories() or setup_directories_from_input_file() first.")
     
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # INPUT_DIR is optional (not used when processing from existing file)
+    if INPUT_DIR is not None:
+        INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def save_summits_geojson(summits: List[Dict], association: str, region: str) -> Path:
     """Save summit data as GeoJSON in the input directory"""
@@ -228,11 +252,10 @@ def save_summits_geojson(summits: List[Dict], association: str, region: str) -> 
                 "code": summit['summitCode'],
                 "name": summit['name'],
                 "title": summit['summitCode'],
-                "elevationM": summit['altM'],
-                "elevationFt": summit.get('altFt', round(summit['altM'] * 3.28084)),
-                "points": summit.get('points', 0),
-                "validTo": summit.get('validTo', ''),
-                "validFrom": summit.get('validFrom', '')
+                "altM": summit['altM'],
+                "altFt": summit['altFt'],
+                "validTo": summit['validTo'],
+                "validFrom": summit['validFrom']
             }
         }
         features.append(feature)
@@ -397,13 +420,21 @@ def determine_needed_adjacent_tiles(distances: Dict[str, float], threshold_m: fl
         needed_directions.append('right')  
     if distances['top'] < threshold_m:
         needed_directions.append('top')
+        if 'left' in needed_directions:
+            needed_directions.append('left-top')
+        if 'right' in needed_directions:
+            needed_directions.append('right-top')
     if distances['bottom'] < threshold_m:
         needed_directions.append('bottom')
+        if 'left' in needed_directions:
+            needed_directions.append('left-bottom')
+        if 'right' in needed_directions:
+            needed_directions.append('right-bottom')
     
     return needed_directions
 
-def calculate_adjacent_tile_centers(center_lon: float, center_lat: float, buffer_m: int = 1000, 
-                                   directions: Optional[List[str]] = None) -> List[Tuple[float, float]]:
+def calculate_adjacent_tile_centers(center_lon: float, center_lat: float, buffer_m: int, 
+                                   directions: List[str]) -> List[Tuple[float, float]]:
     """Calculate center coordinates for adjacent tiles in specific directions
     
     Args:
@@ -412,7 +443,7 @@ def calculate_adjacent_tile_centers(center_lon: float, center_lat: float, buffer
         directions: List of directions to fetch ('left', 'right', 'top', 'bottom')
                    If None, returns center tile only
     
-    Returns a list of (lon, lat) tuples for the requested tiles including center tile.
+    Returns a list of (lon, lat) tuples for the requested tiles.
     """
     # Calculate approximate tile size in degrees
     # Each tile is approximately 2 * buffer_m in size
@@ -421,34 +452,27 @@ def calculate_adjacent_tile_centers(center_lon: float, center_lat: float, buffer
     lat_step = tile_size_m / 111000.0  # Latitude degrees
     lon_step = tile_size_m / (111000.0 * np.cos(np.radians(center_lat)))  # Longitude degrees
     
-    # Always include center tile
-    tile_centers = [(center_lon, center_lat)]
+    tile_centers = []
     
     # Add specific adjacent tiles based on directions
     if directions:
         for direction in directions:
             if direction == 'left':
                 tile_centers.append((center_lon - lon_step, center_lat))
+            elif direction == 'left-top':
+                    tile_centers.append((center_lon - lon_step, center_lat + lat_step))
+            elif direction == 'left-bottom':
+                    tile_centers.append((center_lon - lon_step, center_lat - lat_step))
             elif direction == 'right':
                 tile_centers.append((center_lon + lon_step, center_lat))
+            elif direction == 'right-top':
+                tile_centers.append((center_lon + lon_step, center_lat + lat_step))
+            elif direction == 'right-bottom':
+                tile_centers.append((center_lon + lon_step, center_lat - lat_step))
             elif direction == 'top':
                 tile_centers.append((center_lon, center_lat + lat_step))
             elif direction == 'bottom':
                 tile_centers.append((center_lon, center_lat - lat_step))
-            
-            # Add corner tiles if needed for diagonal coverage
-            if 'left' in directions and 'top' in directions and direction in ['left', 'top']:
-                if (center_lon - lon_step, center_lat + lat_step) not in tile_centers:
-                    tile_centers.append((center_lon - lon_step, center_lat + lat_step))
-            if 'right' in directions and 'top' in directions and direction in ['right', 'top']:
-                if (center_lon + lon_step, center_lat + lat_step) not in tile_centers:
-                    tile_centers.append((center_lon + lon_step, center_lat + lat_step))
-            if 'left' in directions and 'bottom' in directions and direction in ['left', 'bottom']:
-                if (center_lon - lon_step, center_lat - lat_step) not in tile_centers:
-                    tile_centers.append((center_lon - lon_step, center_lat - lat_step))
-            if 'right' in directions and 'bottom' in directions and direction in ['right', 'bottom']:
-                if (center_lon + lon_step, center_lat - lat_step) not in tile_centers:
-                    tile_centers.append((center_lon + lon_step, center_lat - lat_step))
     
     return tile_centers
 
@@ -461,14 +485,11 @@ def download_adjacent_elevation_tiles(center_lon: float, center_lat: float,
     tile_centers = calculate_adjacent_tile_centers(center_lon, center_lat, buffer_m, needed_directions)
     elevation_files = []
     
-    direction_desc = ', '.join(needed_directions) if needed_directions else 'center only'
-    logging.info(f"Downloading targeted elevation tiles ({len(tile_centers)} tiles: center + {direction_desc})")
+    direction_desc = ', '.join(needed_directions)
+    logging.info(f"Downloading additional elevation tiles ({len(needed_directions)} tiles: {direction_desc})")
     
     for i, (tile_lon, tile_lat) in enumerate(tile_centers):
-        if i == 0:
-            logging.info(f"  Downloading center tile: {tile_lon:.6f}, {tile_lat:.6f}")
-        else:
-            logging.info(f"  Downloading adjacent tile {i}: {tile_lon:.6f}, {tile_lat:.6f}")
+        logging.info(f"  Downloading adjacent tile {i}")
         
         elevation_file = download_elevation_data(tile_lon, tile_lat, buffer_m)
         if elevation_file:
@@ -541,461 +562,411 @@ def feet_to_meters(feet: float) -> float:
     """Convert feet to meters"""
     return feet / 3.28084
 
-def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance_ft: float = DEFAULT_ELEVATION_TOLERANCE_FT) -> Optional[Dict]:
-    """Create activation zone based on actual elevation data
+def load_and_validate_elevation_data(elevation_file: Path, summit: Dict, elevation_tolerance_ft: float) -> Optional[Tuple]:
+    """Load and validate elevation data from raster file
     
-    This implements the W7O ARM definition: 'The Activation Zone is a single, "unbroken" area 
-    which can be visualized by drawing a closed shape on a map, following a contour line 82
-    feet below the summit point.'
-    
-    Args:
-        summit: Summit data dictionary
-        elevation_tolerance_ft: Tolerance in feet for validating summit elevation against raster data maximum.
-                               Default is 3 feet.
+    Returns (elevation_data, transform, crs, tiff_bounds, activation_elevation, elevation_units, needs_larger_radius) or None
     """
-    lon = summit['longitude']
-    lat = summit['latitude']
-    summit_alt_ft = summit['altFt']  # Use the integer elevation from SOTA API
+    summit_alt_ft = summit['altFt']
     summit_code = summit['summitCode']
-    
-    # Calculate activation zone elevation in feet (integer arithmetic)
-    # SOTA API provides integer elevationFt, ACTIVATION_ZONE_HEIGHT_FT is integer (82)
-    # Result is always an integer
     activation_alt_ft = summit_alt_ft - ACTIVATION_ZONE_HEIGHT_FT
     
-    logging.info(f"Processing {summit_code}: {summit['name']}")
-    logging.info(f"  Summit elevation: {summit_alt_ft}ft (from SOTA API)")
-    logging.info(f"  Activation zone: {activation_alt_ft}ft")
-    
-    # Download elevation data
-    elevation_file = download_elevation_data(lon, lat, int(BUFFER_RADIUS_KM * 1000))
-    if not elevation_file:
-        logging.error(f"Could not download elevation data for {summit_code}")
-        return None
-    
-    # Load elevation raster
     try:
-        
         with rasterio.open(elevation_file) as src:
             # Read elevation data
             elevation_data = src.read(1)
             transform = src.transform
             crs = src.crs
+            tiff_bounds = src.bounds
             
-            # Get TIFF bounds for boundary analysis
-            tiff_bounds = src.bounds  # (left, bottom, right, top)
-            
-            # Calculate actual TIFF extent 
-            # EPSG:6557 (NAD83(2011) / Oregon GIC Lambert) uses US Survey Feet as units, not meters!
-            tiff_width_ft = tiff_bounds[2] - tiff_bounds[0]  # right - left
-            tiff_height_ft = tiff_bounds[3] - tiff_bounds[1]  # top - bottom
-            
-            # Convert to meters for display
+            # Calculate and log TIFF size - Convert feet to meters for display
+            tiff_width_ft = tiff_bounds[2] - tiff_bounds[0]
+            tiff_height_ft = tiff_bounds[3] - tiff_bounds[1]
             tiff_width_m = tiff_width_ft / 3.28084
             tiff_height_m = tiff_height_ft / 3.28084
             
             logging.debug(f"  TIFF bounds: {tiff_bounds}")
-            logging.debug(f"  TIFF size: {tiff_width_m:.0f}m × {tiff_height_m:.0f}m ({tiff_width_ft:.0f}ft × {tiff_height_ft:.0f}ft) (requested: {int(BUFFER_RADIUS_KM * 1000 * 2)}m × {int(BUFFER_RADIUS_KM * 1000 * 2)}m)")
+            logging.debug(f"  TIFF size: {tiff_width_m:.0f}m × {tiff_height_m:.0f}m ({tiff_width_ft:.0f}ft × {tiff_height_ft:.0f}ft) (requested: {int(TILE_RADIUS_KM * 1000 * 2)}m × {int(TILE_RADIUS_KM * 1000 * 2)}m)")
             
-            # Detect elevation data units by examining the data range
+            # Validate data coverage
             data_min = np.nanmin(elevation_data)
             data_max = np.nanmax(elevation_data)
-            
-            if np.isnan(data_min) or np.isnan(data_max):
-                logging.error(f"Invalid raster elevation data range: {data_min} to {data_max}")
-                return None
-
-            # Check if we have valid elevation data
             valid_data_count = np.sum(~np.isnan(elevation_data))
             total_pixels = elevation_data.size
             valid_data_ratio = valid_data_count / total_pixels
             
             logging.debug(f"  Elevation data coverage: {valid_data_ratio:.1%} ({valid_data_count}/{total_pixels} pixels)")
             
-            if valid_data_ratio < 0.1:  # Less than 10% valid data
+            if valid_data_ratio < 0.1:
                 logging.error(f"Insufficient elevation data coverage ({valid_data_ratio:.1%}) for {summit_code}")
                 return None
             
-            # Determine activation elevation in the appropriate units for the raster data
-            # If the elevation data appears to be in feet (SOTA alt is close),
-            # use our pre-calculated activation elevation in feet, otherwise convert to meters
+            # Determine activation elevation and units
             if abs(data_max - activation_alt_ft) < 500:  # Likely feet
-                activation_elevation = activation_alt_ft  # Use feet directly
+                activation_elevation = activation_alt_ft
                 elevation_units = "ft"
                 logging.debug(f"  Detected elevation data in feet, using activation elevation: {activation_elevation}ft")
             else:  # Likely meters
-                activation_elevation = feet_to_meters(activation_alt_ft)  # Convert to meters
+                activation_elevation = feet_to_meters(activation_alt_ft)
                 elevation_units = "m"
-                logging.info(f"  Detected elevation data in meters, using activation elevation: {activation_elevation:.1f}m")
+                logging.debug(f"  Detected elevation data in meters, using activation elevation: {activation_elevation:.1f}m")
             
-            # Generate contour lines at the activation elevation
-            # This creates a "closed shape following a contour line 82 feet below the summit point"
-            # as specified in the W7O ARM definition
-            
-            # Create coordinate arrays for the elevation data
-            height, width = elevation_data.shape
-            cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-            
-            # Transform pixel coordinates to geographic coordinates
-            xs = []
-            ys = []
-            for i in range(height):
-                for j in range(width):
-                    x, y = xy(transform, i, j)
-                    xs.append(x)
-                    ys.append(y)
-            
-            x_coords = np.array(xs).reshape(height, width)
-            y_coords = np.array(ys).reshape(height, width)
-            
-            # Replace nodata values with NaN
-            elevation_clean = elevation_data.copy().astype(float)
-            if hasattr(src, 'nodata') and src.nodata is not None:
-                elevation_clean[elevation_data == src.nodata] = np.nan
-            
-            # Validate elevation data and summit elevation relationship
-            # Convert raster elevation range to feet for comparison with SOTA API elevation
-            if elevation_units == "ft":
-                raster_max_ft = data_max
-                raster_min_ft = data_min
-            else:  # meters
-                raster_max_ft = meters_to_feet(data_max)
-                raster_min_ft = meters_to_feet(data_min)
-            
-            # Check if summit elevation matches raster maximum (within tolerance)
-            summit_raster_diff = abs(summit_alt_ft - raster_max_ft)
-            
-            if summit_raster_diff > elevation_tolerance_ft:
-                logging.error(f"  Summit elevation ({summit_alt_ft}ft) differs from raster maximum ({raster_max_ft:.1f}ft) by {summit_raster_diff:.1f}ft")
-                logging.error(f"  This exceeds tolerance ({elevation_tolerance_ft:.1f}ft) - data validation failed")
-                return None
-            else:
+            # Validate summit elevation against raster
+            needs_larger_radius = False
+            if not np.isnan(data_min) and not np.isnan(data_max):
+                if elevation_units == "ft":
+                    raster_max_ft = data_max
+                else:
+                    raster_max_ft = meters_to_feet(data_max)
+                
+                summit_raster_diff = abs(summit_alt_ft - raster_max_ft)
+                                
+                if summit_raster_diff > elevation_tolerance_ft:
+                    logging.warning(f"  Summit elevation ({summit_alt_ft}ft) differs from raster maximum ({raster_max_ft:.1f}ft) by {summit_raster_diff:.1f}ft")
+                    logging.warning(f"  This exceeds tolerance ({elevation_tolerance_ft:.1f}ft)")
+                #    return None
+                
                 logging.info(f"  Summit elevation validation: SOTA {summit_alt_ft}ft vs raster max {raster_max_ft:.1f}ft (diff: {summit_raster_diff:.1f}ft)")
                             
-            # Check if raster max is higher - if so, we should use that for safety
-            if raster_max_ft > summit_alt_ft:
-                    logging.warning(f"  Raster maximum ({raster_max_ft:.2f}ft) is higher than SOTA db summit elevation ({summit_alt_ft}ft)")
-                    logging.warning(f"  Using raster maximum for activation zone calculation to ensure conservative/smallest AZ")
+                if raster_max_ft > summit_alt_ft:
+                    logging.warning(f"  Using highest maximum for activation zone calculation to ensure conservative/smallest AZ")
                     
-                    # Recalculate activation elevation based on raster maximum
                     corrected_activation_alt_ft = raster_max_ft - ACTIVATION_ZONE_HEIGHT_FT
-                    
                     if elevation_units == "ft":
                         activation_elevation = corrected_activation_alt_ft
-                    else:  # meters
+                    else:
                         activation_elevation = feet_to_meters(corrected_activation_alt_ft)
                     
-                    logging.warning(f"  Corrected activation elevation: {corrected_activation_alt_ft}ft ({activation_elevation:.1f}{elevation_units})")
+                    logging.warning(f"  Updated AZ elevation: {activation_elevation:.1f}{elevation_units}")
+                
+                logging.info(f"  Raster elevation range: {data_min:.1f}{elevation_units} to {data_max:.1f}{elevation_units}")
 
-            # The AZ is of course below the summit, but does the tile contain at least some of it?
-            if elevation_units == "ft":
-                range_desc = f"{data_min:.0f}ft to {data_max:.0f}ft"
-            else:  # meters
-                range_desc = f"{data_min:.1f}m to {data_max:.1f}m"
+                if activation_elevation < data_min:
+                    logging.warning(f"  Activation elevation ({activation_elevation:.1f}{elevation_units}) is below raster minimum - will need larger radius")
+                    needs_larger_radius = True
             
-            logging.info(f"  Raster elevation range: {range_desc}")
-
-            if activation_elevation < data_min:
-                logging.warning(f"  Activation elevation ({activation_elevation:.1f}{elevation_units}) is below raster minimum - expanding tileset to cover")
-                    
-            # Generate contour lines at the activation elevation
-            # Try single tile first, then multi-tile if contours are too close to boundaries
-            
-            polygon_shapes = []
-            all_contour_coords = []
-            contour_failure_reason = None
-            needs_multi_tile = False
-            needed_directions = []
-            
-            # First attempt: single tile contour generation
-            fig, ax = plt.subplots(figsize=(1, 1))  # Small figure to save memory
-            try:
-                contour_set = ax.contour(x_coords, y_coords, elevation_clean, levels=[activation_elevation])
-                
-                # Extract contour paths and convert to polygons
-                polygon_shapes = []
-                all_contour_coords = []
-                
-                # Access contour segments from allsegs
-                for level_idx, level_segs in enumerate(contour_set.allsegs):
-                    for seg in level_segs:
-                        if len(seg) < 3:
-                            continue  # Skip invalid segments
-                        
-                        # Store coordinates for boundary analysis
-                        all_contour_coords.extend(seg)
-                        
-                        # Close the polygon if it's not already closed
-                        if not np.allclose(seg[0], seg[-1]):
-                            seg = np.vstack([seg, seg[0]])
-                        
-                        # Create Shapely polygon
-                        try:
-                            poly = Polygon(seg)
-                            if poly.is_valid and not poly.is_empty:
-                                polygon_shapes.append(poly)
-                        except Exception as e:
-                            logging.warning(f"Skipping invalid contour polygon: {e}")
-                            continue
-                
-                # Analyze contour boundary distances if we found contours
-                if all_contour_coords:
-                    distances = calculate_distance_to_edges(all_contour_coords, tiff_bounds, str(crs))
-                    logging.debug(f"  Contour distances to TIFF edges - Overall: {distances['overall']:.0f}m, "
-                               f"Left: {distances['left']:.0f}m, Right: {distances['right']:.0f}m, "
-                               f"Bottom: {distances['bottom']:.0f}m, Top: {distances['top']:.0f}m")
-                    
-                    # Check if we need adjacent tiles (contour within 10m of any edge)
-                    needed_directions = determine_needed_adjacent_tiles(distances, threshold_m=10.0)
-                    if needed_directions:
-                        needs_multi_tile = True
-                        direction_desc = ', '.join(needed_directions)
-                        logging.warning(f"  Contour very close to TIFF boundary - closest edges: {direction_desc} "
-                                      f"(distances: {distances['overall']:.0f}m) - will fetch adjacent tiles")
-                    elif distances['overall'] > 0.5 * BUFFER_RADIUS_KM:  # Far from edge (> half the radius)
-                        logging.info(f"  Contour well within tile boundary ({distances['overall']:.0f}m from edge)")
-                    else:
-                        logging.info(f"  Contour reasonably within tile boundary ({distances['overall']:.0f}m from edge)")
-
-            except Exception as e:
-                contour_failure_reason = str(e)
-                logging.error(f"Error generating contours: {e}")
-                
-                # Check if failure might be due to data extent issues
-                summit_in_bounds = (tiff_bounds[0] <= lon <= tiff_bounds[2] and 
-                                  tiff_bounds[1] <= lat <= tiff_bounds[3])
-                if not summit_in_bounds:
-                    logging.error(f"  Summit point ({lon:.6f}, {lat:.6f}) is outside TIFF bounds {tiff_bounds}")
-                    contour_failure_reason += " - Summit outside elevation data"
-                    needs_multi_tile = True  # Try multi-tile for summit outside bounds
-                    needed_directions = ['left', 'right', 'top', 'bottom']  # Try all directions for summit outside bounds
-                polygon_shapes = []
-            finally:
-                plt.close(fig)  # Clean up
-            
-            # Second attempt: targeted adjacent tiles if needed
-            if needs_multi_tile:
-                logging.info(f"  Attempting targeted adjacent tile elevation data fetch...")
-                
-                # Download only the needed adjacent tiles
-                elevation_files = download_adjacent_elevation_tiles(lon, lat, needed_directions, int(BUFFER_RADIUS_KM * 1000))
-                
-                if len(elevation_files) >= 2:  # Need at least center + 1 adjacent tile
-                    # Merge the tiles
-                    merge_result = merge_elevation_tiles(elevation_files)
-                    
-                    if merge_result:
-                        elevation_data, transform, crs = merge_result
-                        
-                        # Get new TIFF bounds from merged data
-                        height, width = elevation_data.shape
-                        
-                        # Calculate bounds using rasterio transform functions
-                        from rasterio.transform import array_bounds
-                        tiff_bounds = array_bounds(height, width, transform)
-                        
-                        # Calculate new TIFF size for logging
-                        tiff_width_units = tiff_bounds[2] - tiff_bounds[0]
-                        tiff_height_units = tiff_bounds[3] - tiff_bounds[1]
-                        
-                        if str(crs).upper() in ['EPSG:6557']:  # Oregon Lambert in feet
-                            tiff_width_m = tiff_width_units / 3.28084
-                            tiff_height_m = tiff_height_units / 3.28084
-                            logging.info(f"  Adjacent-tile TIFF size: {tiff_width_m:.0f}m × {tiff_height_m:.0f}m ({tiff_width_units:.0f}ft × {tiff_height_units:.0f}ft)")
-                        else:
-                            logging.info(f"  Adjacent-tile TIFF size: {tiff_width_units:.0f}m × {tiff_height_units:.0f}m")
-                        
-                        # Recalculate coordinate arrays for merged data
-                        cols, rows = np.meshgrid(np.arange(width), np.arange(height))
-                        
-                        xs = []
-                        ys = []
-                        for i in range(height):
-                            for j in range(width):
-                                x, y = xy(transform, i, j)
-                                xs.append(x)
-                                ys.append(y)
-                        
-                        x_coords = np.array(xs).reshape(height, width)
-                        y_coords = np.array(ys).reshape(height, width)
-                        
-                        # Replace nodata values with NaN
-                        elevation_clean = elevation_data.copy().astype(float)
-                        # Note: merged data may not have consistent nodata values, rely on NaN masking
-                        elevation_clean[np.isnan(elevation_clean)] = np.nan
-                        elevation_clean[elevation_clean < -1000] = np.nan  # Remove obvious invalid values
-                        
-                        # Re-attempt contour generation with merged data
-                        fig, ax = plt.subplots(figsize=(1, 1))
-                        multi_tile_polygon_shapes = []
-                        multi_tile_contour_coords = []
-                        multi_tile_failure_reason = None
-                        
-                        try:
-                            contour_set = ax.contour(x_coords, y_coords, elevation_clean, levels=[activation_elevation])
-                            
-                            # Extract contour paths and convert to polygons
-                            for level_idx, level_segs in enumerate(contour_set.allsegs):
-                                for seg in level_segs:
-                                    if len(seg) < 3:
-                                        continue
-                                    
-                                    multi_tile_contour_coords.extend(seg)
-                                    
-                                    if not np.allclose(seg[0], seg[-1]):
-                                        seg = np.vstack([seg, seg[0]])
-                                    
-                                    try:
-                                        poly = Polygon(seg)
-                                        if poly.is_valid and not poly.is_empty:
-                                            multi_tile_polygon_shapes.append(poly)
-                                    except Exception as e:
-                                        logging.warning(f"Skipping invalid adjacent-tile contour polygon: {e}")
-                                        continue
-                            
-                            # Analyze new contour boundary distances
-                            if multi_tile_contour_coords:
-                                distances = calculate_distance_to_edges(multi_tile_contour_coords, tiff_bounds, str(crs))
-                                logging.info(f"  Adjacent-tile contour distance to boundary: {distances['overall']:.0f}m")
-                                if distances['overall'] < 10:
-                                    logging.warning(f"  Adjacent-tile contour still very close to boundary ({distances['overall']:.0f}m)")
-                                else:
-                                    logging.info(f"  Adjacent-tile contour well positioned ({distances['overall']:.0f}m from edge)")
-                            
-                            # Use multi-tile polygons if they're better (contain summit and are valid)
-                            if multi_tile_polygon_shapes:
-                                # Check if multi-tile polygons contain the summit
-                                # Transform summit point to the same CRS as the elevation data and contours
-                                if str(crs) != 'EPSG:4326':
-                                    transformer = Transformer.from_crs('EPSG:4326', str(crs), always_xy=True)
-                                    summit_x_crs, summit_y_crs = transformer.transform(lon, lat)
-                                    summit_point = Point(summit_x_crs, summit_y_crs)
-                                else:
-                                    summit_point = Point(lon, lat)
-                                
-                                # Find multi-tile polygon containing summit
-                                for i, poly in enumerate(multi_tile_polygon_shapes):
-                                    if poly.contains(summit_point) or poly.distance(summit_point) < 0.001:
-                                        logging.info(f"  Using adjacent-tile polygon (better boundary clearance)")
-                                        polygon_shapes = multi_tile_polygon_shapes
-                                        all_contour_coords = multi_tile_contour_coords
-                                        break
-                        
-                        except Exception as e:
-                            multi_tile_failure_reason = str(e)
-                            logging.error(f"Error generating adjacent-tile contours: {e}")
-                        finally:
-                            plt.close(fig)
-                        
-                        if len(multi_tile_polygon_shapes) > 0:
-                            logging.info(f"  Adjacent-tile attempt successful: found {len(multi_tile_polygon_shapes)} contour polygon(s)")
-                        else:
-                            logging.warning(f"  Adjacent-tile attempt did not improve results")
-                    else:
-                        logging.error(f"  Failed to merge elevation tiles")
-                else:
-                    logging.error(f"  Insufficient elevation tiles downloaded ({len(elevation_files)} tiles)")
-            
-            if not polygon_shapes:
-                error_msg = f"No valid contour polygons found at activation elevation for {summit_code}"
-                if contour_failure_reason:
-                    error_msg += f" - Reason: {contour_failure_reason}"
-                logging.error(error_msg)
-                return None
-            
-            logging.info(f"  Found {len(polygon_shapes)} contour polygon(s)")
-            
-            # Find the polygon that contains the summit point
-            # This ensures we get the "unbroken area" that includes the summit point
-            # as specified in the ARM definition
-            
-            # Transform summit point to the same CRS as the elevation data and contours
-            if crs != 'EPSG:4326':
-                transformer = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
-                summit_x_crs, summit_y_crs = transformer.transform(lon, lat)
-                summit_point = Point(summit_x_crs, summit_y_crs)
-                logging.debug(f"  Summit point in data CRS: ({summit_x_crs:.1f}, {summit_y_crs:.1f})")
-            else:
-                summit_point = Point(lon, lat)
-                logging.debug(f"  Summit point in WGS84: ({lon:.6f}, {lat:.6f})")
-            
-            activation_geometry = None
-            
-            # First try to find a polygon that contains the summit
-            for i, poly in enumerate(polygon_shapes):
-                distance = poly.distance(summit_point)
-                contains = poly.contains(summit_point)
-                logging.debug(f"  Polygon {i+1}: distance={distance:.3f}, contains={contains}")
-                
-                if contains or distance < 0.001:  # Small tolerance
-                    activation_geometry = poly
-                    logging.info(f"  Selected polygon {i+1} containing summit point")
-                    break
-            
-            # If no polygon contains the summit, fail this summit
-            if activation_geometry is None:
-                logging.error(f"Summit not contained in any contour polygon - activation zone definition not met")
-                logging.error(f"Found {len(polygon_shapes)} contour(s) but none contain the summit point")
-                return None
-            
-            num_coords = len(activation_geometry.exterior.coords)
-            logging.info(f"  Generated contour polygon with {num_coords} coordinate points")
-            
-            # Transform to WGS84 if needed
-            if crs != 'EPSG:4326':
-                logging.info(f"  Transforming coordinates from {crs} to WGS84")
-                transformer = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
-                
-                def transform_coords(coords):
-                    return [transformer.transform(x, y) for x, y in coords]
-                
-                if isinstance(activation_geometry, Polygon):
-                    exterior_coords = transform_coords(activation_geometry.exterior.coords)
-                    holes = [transform_coords(interior.coords) for interior in activation_geometry.interiors]
-                    activation_geometry = Polygon(exterior_coords, holes)
-                elif isinstance(activation_geometry, MultiPolygon):
-                    transformed_polygons = []
-                    for poly in activation_geometry.geoms:
-                        exterior_coords = transform_coords(poly.exterior.coords)
-                        holes = [transform_coords(interior.coords) for interior in poly.interiors]
-                        transformed_polygons.append(Polygon(exterior_coords, holes))
-                    activation_geometry = MultiPolygon(transformed_polygons)
-            
-            # Convert to GeoJSON
-            geom_dict = None
-            if isinstance(activation_geometry, Polygon):
-                geom_dict = {
-                    "type": "Polygon",
-                    "coordinates": [list(activation_geometry.exterior.coords)] + 
-                                  [list(interior.coords) for interior in activation_geometry.interiors]
-                }
-            elif isinstance(activation_geometry, MultiPolygon):
-                geom_dict = {
-                    "type": "MultiPolygon", 
-                    "coordinates": [
-                        [list(poly.exterior.coords)] + [list(interior.coords) for interior in poly.interiors]
-                        for poly in activation_geometry.geoms
-                    ]
-                }
-            
-            if geom_dict is None:
-                logging.error(f"Could not create geometry for {summit_code}")
-                return None
-            
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "title": summit['summitCode'] + " Activation Zone",
-                },
-                "geometry": geom_dict
-            }
-            
-            logging.info(f"  Successfully created elevation-based activation zone for {summit_code}")
-            return feature
+            return elevation_data, transform, crs, tiff_bounds, activation_elevation, elevation_units, needs_larger_radius
             
     except Exception as e:
-        logging.error(f"Error processing elevation data for {summit_code}: {str(e)}")
+        logging.error(f"Error loading elevation data: {e}")
         return None
+
+def create_coordinate_mesh(elevation_data: np.ndarray, transform: object) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Create coordinate mesh and clean elevation data for contour generation"""
+    height, width = elevation_data.shape
+    
+    # Transform pixel coordinates to geographic coordinates
+    xs = []
+    ys = []
+    for i in range(height):
+        for j in range(width):
+            x, y = xy(transform, i, j)
+            xs.append(x)
+            ys.append(y)
+    
+    x_coords = np.array(xs).reshape(height, width)
+    y_coords = np.array(ys).reshape(height, width)
+    
+    # Clean elevation data
+    elevation_clean = elevation_data.copy().astype(float)
+    # Handle potential nodata values
+    elevation_clean[elevation_clean < -1000] = np.nan
+    elevation_clean[np.isnan(elevation_clean)] = np.nan
+    
+    return x_coords, y_coords, elevation_clean
+
+def generate_contour_polygons(x_coords: np.ndarray, y_coords: np.ndarray, 
+                            elevation_clean: np.ndarray, activation_elevation: float) -> Tuple[List, List, Optional[str]]:
+    """Generate contour polygons at the activation elevation
+    
+    Returns (polygon_shapes, contour_coords, failure_reason)
+    """
+    polygon_shapes = []
+    all_contour_coords = []
+    contour_failure_reason = None
+    
+    fig, ax = plt.subplots(figsize=(1, 1))
+    try:
+        contour_set = ax.contour(x_coords, y_coords, elevation_clean, levels=[activation_elevation])
+        
+        # Extract contour paths and convert to polygons
+        for level_idx, level_segs in enumerate(contour_set.allsegs):
+            for seg in level_segs:
+                if len(seg) < 3:
+                    continue
+                
+                all_contour_coords.extend(seg)
+                
+                # Close the polygon if needed
+                if not np.allclose(seg[0], seg[-1]):
+                    seg = np.vstack([seg, seg[0]])
+                
+                try:
+                    poly = Polygon(seg)
+                    if poly.is_valid and not poly.is_empty:
+                        polygon_shapes.append(poly)
+                except Exception as e:
+                    logging.warning(f"Skipping invalid contour polygon: {e}")
+                    continue
+                    
+    except Exception as e:
+        contour_failure_reason = str(e)
+        logging.error(f"Error generating contours: {e}")
+    finally:
+        plt.close(fig)
+    
+    return polygon_shapes, all_contour_coords, contour_failure_reason
+
+def select_summit_containing_polygon(polygon_shapes: List, summit_lon: float, summit_lat: float, 
+                                   crs: str) -> Optional[Polygon]:
+    """Select the polygon that contains the summit point"""
+    if not polygon_shapes:
+        return None
+    
+    # Transform summit point to data CRS if needed
+    if crs != 'EPSG:4326':
+        transformer = Transformer.from_crs('EPSG:4326', crs, always_xy=True)
+        summit_x_crs, summit_y_crs = transformer.transform(summit_lon, summit_lat)
+        summit_point = Point(summit_x_crs, summit_y_crs)
+        logging.debug(f"  Summit point in data CRS: ({summit_x_crs:.1f}, {summit_y_crs:.1f})")
+    else:
+        summit_point = Point(summit_lon, summit_lat)
+        logging.debug(f"  Summit point in WGS84: ({summit_lon:.6f}, {summit_lat:.6f})")
+    
+    # Find polygon containing summit
+    for i, poly in enumerate(polygon_shapes):
+        distance = poly.distance(summit_point)
+        contains = poly.contains(summit_point)
+        logging.debug(f"  Polygon {i+1}: distance={distance:.3f}, contains={contains}")
+        
+        if contains or distance < 0.001:
+            logging.info(f"  Selected polygon {i+1} containing summit point")
+            return poly
+    
+    return None
+
+def convert_polygon_to_geojson(polygon: Polygon, summit_code: str, crs: str) -> Optional[Dict]:
+    """Convert Shapely polygon to GeoJSON feature, transforming coordinates if needed"""
+    try:
+        # Transform to WGS84 if needed
+        if crs != 'EPSG:4326':
+            logging.debug(f"  Transforming coordinates from {crs} to WGS84")
+            transformer = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
+            
+            def transform_coords(coords):
+                return [transformer.transform(x, y) for x, y in coords]
+            
+            if isinstance(polygon, Polygon):
+                exterior_coords = transform_coords(polygon.exterior.coords)
+                holes = [transform_coords(interior.coords) for interior in polygon.interiors]
+                polygon = Polygon(exterior_coords, holes)
+            elif isinstance(polygon, MultiPolygon):
+                transformed_polygons = []
+                for poly in polygon.geoms:
+                    exterior_coords = transform_coords(poly.exterior.coords)
+                    holes = [transform_coords(interior.coords) for interior in poly.interiors]
+                    transformed_polygons.append(Polygon(exterior_coords, holes))
+                polygon = MultiPolygon(transformed_polygons)
+        
+        # Convert to GeoJSON
+        if isinstance(polygon, Polygon):
+            geom_dict = {
+                "type": "Polygon",
+                "coordinates": [list(polygon.exterior.coords)] + 
+                              [list(interior.coords) for interior in polygon.interiors]
+            }
+        elif isinstance(polygon, MultiPolygon):
+            geom_dict = {
+                "type": "MultiPolygon", 
+                "coordinates": [
+                    [list(poly.exterior.coords)] + [list(interior.coords) for interior in poly.interiors]
+                    for poly in polygon.geoms
+                ]
+            }
+        else:
+            logging.error(f"Unsupported geometry type: {type(polygon)}")
+            return None
+        
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "title": summit_code + " Activation Zone",
+            },
+            "geometry": geom_dict
+        }
+        
+        return feature
+        
+    except Exception as e:
+        logging.error(f"Error converting polygon to GeoJSON: {e}")
+        return None
+
+def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance_ft: float = DEFAULT_ELEVATION_TOLERANCE_FT) -> Optional[Dict]:
+    """Create activation zone based on actual elevation data
+    
+    This implements the W7O ARM definition: 'The Activation Zone is a single, "unbroken" area 
+    which can be visualized by drawing a closed shape on a map, following a contour line 82
+    feet below the summit point.' Other associations may have their own definitions, especially
+    regarding ft vs meters.
+    
+    Args:
+        summit: Summit data dictionary
+        elevation_tolerance_ft: Tolerance in feet for validating summit elevation against raster data maximum.
+    """
+    summit_code = summit['summitCode']
+    summit_lat = summit['latitude']
+    summit_lon = summit['longitude']
+    
+    logging.info(f"  Summit elevation: {summit['altFt']}ft (from SOTA API)")
+    logging.info(f"  Activation zone: {summit['altFt'] - ACTIVATION_ZONE_HEIGHT_FT}ft")
+    
+    # Get elevation file
+    elevation_file = download_elevation_data(summit_lon, summit_lat, int(TILE_RADIUS_KM * 1000))
+    if not elevation_file:
+        logging.error(f"Failed to get elevation data for {summit_code}")
+        return None
+    
+    # Load and validate elevation data
+    result = load_and_validate_elevation_data(elevation_file, summit, elevation_tolerance_ft)
+    if not result:
+        return None
+    
+    elevation_data, transform, crs, tiff_bounds, activation_elevation, elevation_units, needs_larger_radius = result
+    
+    # If activation elevation is below minimum, try with 2x radius
+    if needs_larger_radius:
+        logging.info(f"  Retrying with 2x radius due to activation elevation below raster minimum")
+        larger_elevation_file = download_elevation_data(summit_lon, summit_lat, int(TILE_RADIUS_KM * 1000 * 2))
+        if larger_elevation_file:
+            larger_result = load_and_validate_elevation_data(larger_elevation_file, summit, elevation_tolerance_ft)
+            if larger_result:
+                elevation_data, transform, crs, tiff_bounds, activation_elevation, elevation_units, still_needs_larger = larger_result
+                if not still_needs_larger:
+                    logging.info(f"  Successfully obtained suitable elevation data with 2x radius")
+                    elevation_file = larger_elevation_file  # Use the larger file for subsequent processing
+                else:
+                    logging.error(f"  Activation elevation still below minimum even with 2x radius")
+                    return None
+            else:
+                logging.error(f"  Failed to validate 2x radius elevation data")
+                return None
+        else:
+            logging.warning(f"  Failed to download 2x radius elevation data")
+            return None
+    
+    # Create coordinate mesh
+    x_coords, y_coords, elevation_clean = create_coordinate_mesh(elevation_data, transform)
+    
+    # Generate initial contour polygons
+    polygon_shapes, all_contour_coords, contour_failure_reason = generate_contour_polygons(
+        x_coords, y_coords, elevation_clean, activation_elevation
+    )
+    
+    # Check if contour generation failed
+    if contour_failure_reason:
+        logging.error(f"Initial contour generation failed for {summit_code}: {contour_failure_reason}")
+        return None
+    
+    if not polygon_shapes:
+        logging.error(f"No contour polygons generated for {summit_code}")
+        return None
+    
+    # Check boundary distances and fetch additional tiles if needed
+    boundary_analysis = calculate_distance_to_edges(all_contour_coords, tiff_bounds, str(crs))
+    needed_tiles = determine_needed_adjacent_tiles(boundary_analysis, threshold_m=10.0)
+
+    print_analysis = lambda message: logging.info(f'{message}: margins [{', '.join([f"{k}: {v:.1f}m" for k, v in boundary_analysis.items()])}]')
+
+    if needed_tiles:
+        print_analysis("Single tile contour approaches tile boundary")
+        logging.info(f"  Fetching adjacent tiles: {needed_tiles}")
+        
+        # Download additional tiles
+        additional_files = download_adjacent_elevation_tiles(
+            summit_lon, summit_lat, needed_tiles, int(TILE_RADIUS_KM * 1000)
+        )
+        
+        if additional_files:
+            # Merge elevation data
+            try:
+                merge_result = merge_elevation_tiles([elevation_file] + additional_files)
+                
+                # Re-process with merged data
+                if merge_result:
+                    elevation_data, transform, crs = merge_result
+                    
+                    # Validate and process the merged data
+                    data_min = np.nanmin(elevation_data)
+                    data_max = np.nanmax(elevation_data)
+                    summit_alt_ft = summit['altFt']
+                    
+                    # Determine activation elevation and units
+                    if abs(data_max - summit_alt_ft) < 500:  # Likely feet
+                        activation_elevation = summit_alt_ft - ACTIVATION_ZONE_HEIGHT_FT
+                        elevation_units = "ft"
+                    else:  # Likely meters
+                        activation_elevation = feet_to_meters(summit_alt_ft - ACTIVATION_ZONE_HEIGHT_FT)
+                        elevation_units = "m"
+                    
+                    # Get bounds for the merged data
+                    height, width = elevation_data.shape
+                    from rasterio.transform import array_bounds
+                    tiff_bounds = array_bounds(height, width, transform)
+                    
+                    x_coords, y_coords, elevation_clean = create_coordinate_mesh(elevation_data, transform)
+                    polygon_shapes, all_contour_coords, contour_failure_reason = generate_contour_polygons(
+                        x_coords, y_coords, elevation_clean, activation_elevation
+                    )
+                    
+                    if contour_failure_reason:
+                        logging.error(f"Multi-tile contour generation failed for {summit_code}: {contour_failure_reason}")
+                        return None
+                    
+                    if not polygon_shapes:
+                        logging.error(f"No contour polygons generated from merged tiles for {summit_code}")
+                        return None
+                    
+                    # Recalculate boundary analysis
+                    boundary_analysis = calculate_distance_to_edges(all_contour_coords, tiff_bounds, str(crs))
+                    print_analysis("Multi-tile boundary analysis")
+                else:
+                    logging.error(f"Failed to merge elevation data for {summit_code}")
+                    return None
+                    
+            except Exception as e:
+                logging.error(f"Error processing multi-tile data for {summit_code}: {e}")
+                return None
+        else:
+            logging.warning(f"Failed to download additional tiles for {summit_code}, proceeding with single tile")
+    else:
+        print_analysis("  Single tile fits contour")
+    
+    # Select the polygon containing the summit
+    selected_polygon = select_summit_containing_polygon(polygon_shapes, summit_lon, summit_lat, str(crs))
+    
+    if not selected_polygon:
+        logging.error(f"No polygon contains summit point for {summit_code}")
+        return None
+    
+    # Log polygon statistics
+    if elevation_units == "ft":
+        area_ft2 = selected_polygon.area
+        area_acres = area_ft2 / 43560
+        area_m2 = area_ft2 / (3.28084 ** 2)
+        logging.info(f"  Polygon area: {area_acres:.2f} acres ({area_m2:.0f} m²)")
+    else:
+        area_m2 = selected_polygon.area
+        area_acres = area_m2 * 0.000247105
+        logging.info(f"  Polygon area: {area_acres:.2f} acres ({area_m2:.0f} m²)")
+    
+    # Convert to GeoJSON
+    feature = convert_polygon_to_geojson(selected_polygon, summit_code, str(crs))
+    if not feature:
+        logging.error(f"Failed to convert polygon to GeoJSON for {summit_code}")
+        return None
+    
+    logging.info(f"  Successfully created activation zone for {summit_code}")
+    return feature
 
 def process_summit(summit: Dict, elevation_tolerance_ft: float = DEFAULT_ELEVATION_TOLERANCE_FT) -> bool:
     """Process a single summit and generate activation zone GeoJSON"""
@@ -1010,7 +981,7 @@ def process_summit(summit: Dict, elevation_tolerance_ft: float = DEFAULT_ELEVATI
     feature = create_activation_zone_elevation_based(summit, elevation_tolerance_ft)
     
     if not feature:
-        logging.error(f"Failed to process {summit['summitCode']} - could not retrieve elevation data")
+        logging.error(f"Failed to process {summit['summitCode']}")
         return False
     
     # Create GeoJSON document
@@ -1031,72 +1002,75 @@ def process_summit(summit: Dict, elevation_tolerance_ft: float = DEFAULT_ELEVATI
         return False
 
 def parse_arguments():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="SOTA Activation Zone Processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # From W7O directory - association auto-detected, region required
-  python process_sota_az.py --fetch-only --region NC
-  python process_sota_az.py --summits W7O_NC/input/W7O_NC.geojson --region NC
-  python process_sota_az.py --region NC
+  # Fetch summit data and process activation zones
+  python generate_sota_az.py --region NC
   
-  # Explicit association and region
-  python process_sota_az.py --association W7O --region NC
-  python process_sota_az.py --association W7W --region LC --fetch-only
+  # Fetch summit data only (no processing)
+  python generate_sota_az.py --fetch-only --region NC
+  
+  # Process from summit file using file's directory for output
+  python generate_sota_az.py --summits W7O_NC/input/W7O_NC.geojson
+  python generate_sota_az.py --summits /path/to/summits.geojson
+  
+  # Process from summit file with custom output directory
+  python generate_sota_az.py --summits summits.geojson --output-dir /custom/path
   
   # Custom elevation tolerance for edge cases
-  python process_sota_az.py --region NC --elevation-tolerance 5.0
+  python generate_sota_az.py --summits summits.geojson --elevation-tolerance 5.0
   
   # Logging options
-  python process_sota_az.py --region NC --log-file processing.log
-  python process_sota_az.py --region NC --log-file processing.log --quiet
+  python generate_sota_az.py --region NC --log-file processing.log
+  python generate_sota_az.py --summits summits.geojson --log-file processing.log --quiet
         """
     )
     
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
-        '--summits',
+        '-s', '--summits',  # Short: -s, Long: --summits
         type=str,
         help='Path to summits GeoJSON file to process'
     )
     group.add_argument(
-        '--association',
+        '-a', '--association',  # Short: -a, Long: --association  
         type=str,
-        help='SOTA association code (e.g., W7O, W7W) - if not provided, will be derived from current directory'
+        help=f'SOTA association code (e.g., W7O, W7W) - default is {DEFAULT_ASSOCIATION}'
     )
-    
     parser.add_argument(
-        '--region',
+        '-r', '--region',  # Short: -r, Long: --region
         type=str,
-        required=True,
-        help='SOTA region code (e.g., NC, LC) - always required'
+        required=False,
+        help='SOTA region code (e.g., NC, LC) - required when fetching from SOTA API'
     )
-    
     parser.add_argument(
-        '--fetch-only',
+        '-o', '--output-dir',  # Short: -o, Long: --output-dir
+        type=str,
+        help='Base directory for cache and output folders when using --summits'
+    )
+    parser.add_argument(
+        '-f', '--fetch-only',  # Short: -f, Long: --fetch-only
         action='store_true',
-        help='Only fetch summit data from SOTA and save to input directory, do not process activation zones'
+        help='Only fetch summit data from SOTA and save to input directory'
     )
-    
     parser.add_argument(
-        '--log-file',
+        '-l', '--log-file',  # Short: -l, Long: --log-file
         type=str,
         help='Log file path (default: output to stdout)'
     )
-    
     parser.add_argument(
-        '--quiet',
+        '-q', '--quiet',  # Short: -q, Long: --quiet
         action='store_true',
-        help='Suppress stdout output when using --log-file (file logging only)'
+        help='Suppress stdout output when using --log-file'
     )
-    
     parser.add_argument(
-        '--elevation-tolerance',
+        '-t', '--elevation-tolerance',  # Short: -t, Long: --elevation-tolerance
         type=float,
         default=DEFAULT_ELEVATION_TOLERANCE_FT,
-        help=f'Tolerance in feet for validating summit elevation against raster data (default: {DEFAULT_ELEVATION_TOLERANCE_FT})'
+        help=f'Tolerance in feet for validating summit elevation against raster data'
     )
     
     args = parser.parse_args()
@@ -1108,32 +1082,33 @@ Examples:
     # Setup logging first so we can see debug messages
     setup_logging(args.log_file, args.quiet)
     
-    # Validate arguments and determine association
+    # Validate arguments and determine association/region
     if args.summits and args.association:
         parser.error("Cannot specify both --summits and --association")
     
-    if not args.summits and not args.association:
-        # Try to derive association from current working directory
-        current_dir = Path.cwd().name
-        if current_dir in ['W7O', 'W7W', 'W6', 'W0C']:  # Common SOTA associations
-            args.association = current_dir
-            logging.info(f"Derived association '{current_dir}' from current directory")
-        else:
-            parser.error("Either --summits or --association is required when current directory doesn't match a known SOTA association (W7O, W7W, etc.)")
-    
+    if args.output_dir and not args.summits:
+        parser.error("--output-dir can only be used with --summits")
+
+    if not args.association:
+        # This script is W7O-specific
+        args.association = DEFAULT_ASSOCIATION
+        logging.info("Using W7O association")
+
+    # Handle summits file processing
     if args.summits:
-        # When processing from file, we need region and optionally association
-        if not args.association:
-            # Try to derive association from current working directory
-            current_dir = Path.cwd().name
-            if current_dir in ['W7O', 'W7W', 'W6', 'W0C']:  # Common SOTA associations
-                args.association = current_dir
-                logging.info(f"Derived association '{current_dir}' from current directory")
-            else:
-                parser.error("--association is required when current directory doesn't match a known SOTA association (W7O, W7W, etc.)")
+        summits_file = Path(args.summits)
+        if not summits_file.exists():
+            parser.error(f"Summit file not found: {summits_file}")
+        
+        # Region is no longer auto-detected, but it's not required for file processing
+        # The user can optionally specify --region but it won't affect directory structure
+
+    # Validate region is provided for API fetch mode
+    if not args.summits and not args.region:
+        parser.error("--region is required when fetching from SOTA API")
     
-    if args.fetch_only and not args.association:
-        parser.error("--fetch-only requires --association and --region")
+    if args.fetch_only and not args.region:
+        parser.error("--fetch-only requires --region")
     
     return args
 
@@ -1148,12 +1123,9 @@ def main():
     if args.summits:
         # Process from existing GeoJSON file
         summits_file = Path(args.summits)
-        if not summits_file.exists():
-            logging.error(f"Summit file not found: {summits_file}")
-            sys.exit(1)
         
-        # Use the provided association and region
-        setup_regional_directories(args.association, args.region)
+        # Setup directories based on file location or specified output directory
+        setup_directories_from_input_file(summits_file, args.output_dir)
         ensure_directories()
         
         logging.info(f"Loading summits from: {summits_file}")
@@ -1180,18 +1152,19 @@ def main():
         if not summits:
             logging.error("Failed to fetch summit data")
             sys.exit(1)
-        
+        logging.info(f"Done fetching {len(summits)} summits from SOTA API")
+
         # Save to input directory
         summits_file = save_summits_geojson(summits, args.association, args.region)
         
-        if args.fetch_only:
-            logging.info(f"\nFetch complete! Summit data saved to: {summits_file}")
-            logging.info(f"To process activation zones, run:")
-            logging.info(f"  python {sys.argv[0]} --summits {summits_file} --region {args.region}")
-            return
+    if args.fetch_only:
+        logging.info(f"\nStopping now due to --fetch-only! Summit data at: {summits_file}")
+        logging.info(f"To process activation zones, run:")
+        logging.info(f"  python {sys.argv[0]} --summits {summits_file}")
+        return
     
     logging.info(f"\nProcessing {len(summits)} summits for activation zones...")
-    logging.info(f"Buffer radius: {BUFFER_RADIUS_KM * 1000:.0f}m")
+    logging.info(f"Initial tile radius: {TILE_RADIUS_KM * 1000:.0f}m")
     logging.info(f"Activation zone height: {ACTIVATION_ZONE_HEIGHT_FT} feet")
     logging.info(f"Elevation tolerance: {args.elevation_tolerance:.1f} feet")
     

@@ -1,7 +1,7 @@
 ## W7O SOTA Activation Zone Processing
 
 The Activation #### Elevation Data Sources
-- **Source**: USGS 3DEP ImageServer (`https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer`)
+- **Source**: Oregon DOGAMI ESRI ImageServer (`https://gis.dogami.oregon.gov/arcgis/rest/services/lidar/DIGITAL_TERRAIN_MODEL_MOSAIC/ImageServer`)
 - **Resolution**: ~3 meter pixel resolution
 - **CRS**: EPSG:6557 (NAD83(2011) / Oregon Statewide Lambert)
 - **Buffer Strategy**: Request 1km × 1km around summit, server returns ~3.4km × 3.4km minimum tiles
@@ -16,7 +16,7 @@ The Activation #### Elevation Data Sources
 
 ### Python Implementation Overview
 
-The current Python implementation (`process_sota_python.py`) uses high-resolution contour generation to create precise activation zone boundaries following natural terrain features. The script automatically detects elevation data units (feet vs meters) and generates smooth polygon boundaries using matplotlib contour extraction.
+The current Python implementation (`generate_sota_az.py`) uses high-resolution contour generation to create precise activation zone boundaries following natural terrain features. The script automatically detects elevation data units (feet vs meters) and generates smooth polygon boundaries using matplotlib contour extraction.
 
 #### Key Features
 - **Contour-based boundaries**: Uses matplotlib to generate smooth elevation contours instead of blocky raster masks
@@ -30,13 +30,13 @@ The current Python implementation (`process_sota_python.py`) uses high-resolutio
 
 ```bash
 # Fetch W7O/NC summits and save to input directory (no processing)
-python process_sota_python.py --fetch-only --association W7O --region NC
+python generate_sota_az.py --fetch-only --association W7O --region NC
 
 # Process summits from existing GeoJSON file
-python process_sota_python.py --summits input/W7O_NC.geojson
+python generate_sota_az.py --summits input/W7O_NC.geojson
 
 # Fetch and process all summits in one operation
-python process_sota_python.py --association W7O --region NC
+python generate_sota_az.py --association W7O --region NC
 ```TA Activation Zone Processing
 
 The Activation Zone, from the W7O ARM:
@@ -83,7 +83,7 @@ The Activation Zone, from the W7O ARM:
    - Calculate target elevation = summit_elevation - 82 feet (25 meters)
    - Generate contour lines at activation elevation using matplotlib
    - Extract contour segments and convert to Shapely polygons
-   - Select polygon containing summit point, or largest polygon if none contain summit
+   - Select polygon containing summit point (fail if none of the polys contain the point)
    - Transform coordinates to WGS84 if needed
 5. **Output Generation**: Save individual GeoJSON files with simplified properties
 
@@ -128,7 +128,7 @@ Files are saved to `output/` subfolder with naming pattern `{ASSOCIATION}_{REGIO
 }
 ```
 
-The output format has been designed to work with SOTLAS.
+The output format has been designed to work with SOTLAS. The title property works with CalTopo
 
 ### ImageServer Query Parameters
 

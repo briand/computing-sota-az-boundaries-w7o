@@ -117,55 +117,51 @@ def create_interactive_map(summits_gdf: gpd.GeoDataFrame,
     # Calculate map center and zoom
     center_lat, center_lon, zoom_level = calculate_map_bounds(summits_gdf, activation_zones_gdf)
     
-    # Create base map with none as default (last added tileset becomes default)
+    # Create base map with OpenTopoMap as the only initial layer
     m = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=zoom_level,
-        tiles=None
+        tiles='https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+        attr='Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="http://viewfinderpanoramas.org">SRTM</a> | Map style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (<a href="https://creativecommons.org/licenses/by-sa/3.0/">CC-BY-SA</a>)'
     )
     
-    # Add ESRI World Imagery for satellite reference
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
-        name='ESRI Satellite',
-        overlay=False,
-        control=True
-    ).add_to(m)
-    
-    # Add standard OpenStreetMap
-    folium.TileLayer(
-        tiles='OpenStreetMap',
-        name='OpenStreetMap',
-        overlay=False,
-        control=True
-    ).add_to(m)
-    
-    folium.TileLayer(
-        tiles='https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-        attr='Map data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, <a href="http://viewfinderpanoramas.org">SRTM</a> | Map style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (<a href="https://creativecommons.org/licenses/by-sa/3.0/">CC-BY-SA</a>)',
-        name='OpenTopoMap (default)',
-        overlay=False,
-        control=True
-    ).add_to(m)
-
-    # Add USGS Imagery+Topo (satellite with topo overlay)
-    folium.TileLayer(
-        tiles='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryTopo/MapServer/tile/{z}/{y}/{x}',
-        attr='USGS National Map',
-        name='USGS Topo',
-        overlay=False,
-        control=True
-    ).add_to(m)
-
-    # Add USGS Pure Topo (no satellite imagery - traditional topo maps)
-    folium.TileLayer(
-        tiles='https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}',
-        attr='USGS National Map',
-        name='USGS Topo (Classic)',
-        overlay=False,
-        control=True
-    ).add_to(m)
+    # Create summit selector data for JavaScript
+    summit_data = []
+    for idx, row in summits_gdf.iterrows():
+        summit_code = row.get('code', row.get('summitCode', f'Summit-{idx}'))
+        summit_name = row.get('name', row.get('title', 'Unknown'))
+        
+        # Find corresponding activation zone
+        az_row = None
+        for az_idx, az_row_candidate in activation_zones_gdf.iterrows():
+            az_title = az_row_candidate.get('title', '')
+            # Check if activation zone title starts with the summit code
+            # e.g., "W7O/NC-001 Activation Zone" should match summit code "W7O/NC-001"
+            if az_title.startswith(summit_code + ' '):
+                az_row = az_row_candidate
+                break
+        
+        summit_info = {
+            'code': summit_code,
+            'name': summit_name,
+            'lat': row.geometry.y,
+            'lon': row.geometry.x,
+            'elevation_m': row.get('elevationM', row.get('altM', 0)),
+            'elevation_ft': row.get('elevationFt', row.get('altFt', 0)),
+            'has_az': az_row is not None
+        }
+        
+        # Add activation zone bounds if available
+        if az_row is not None and az_row.geometry is not None:
+            bounds = az_row.geometry.bounds  # (minx, miny, maxx, maxy)
+            summit_info['az_bounds'] = {
+                'minLat': bounds[1],
+                'minLon': bounds[0], 
+                'maxLat': bounds[3],
+                'maxLon': bounds[2]
+            }
+        
+        summit_data.append(summit_info)
 
     # Add activation zone polygons
     logging.info("Adding activation zone polygons to map...")
@@ -220,22 +216,277 @@ def create_interactive_map(summits_gdf: gpd.GeoDataFrame,
             weight=2
         ).add_to(m)
     
+    # Add alternative tile layers AFTER all map data (these won't load until selected)
+    # Limiting to just 2 essential alternatives to reduce network load
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+        name='ESRI Satellite',
+        overlay=False,
+        control=True
+    ).add_to(m)
+    
+    # Add standard OpenStreetMap
+    folium.TileLayer(
+        tiles='OpenStreetMap',
+        name='OpenStreetMap',
+        overlay=False,
+        control=True
+    ).add_to(m)
+    
     # Add layer control
     folium.LayerControl().add_to(m)
     
     # Add scale bar
     plugins.MeasureControl().add_to(m)
     
-    # Add title
-    title_html = f'''
-    <h3 align="center" style="font-size:20px"><b>SOTA Activation Zones - {region_name}</b></h3>
-    <p align="center" style="font-size:14px">
-    <span style="color:blue">● Summits</span> | 
-    <span style="color:red">█ Activation Zones</span><br>
-    {len(summits_gdf)} summits with {len(activation_zones_gdf)} activation zones
-    </p>
+    # Add summit selector and title with JavaScript functionality
+    summit_selector_html = f'''
+    <div id="summitPanel" style="position: fixed; 
+                top: 10px; 
+                left: 10px; 
+                width: 320px; 
+                background: white; 
+                border: 2px solid #ccc; 
+                border-radius: 5px;
+                padding: 10px;
+                z-index: 1001;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+                font-family: Arial, sans-serif;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <h3 style="margin: 0; font-size: 16px; flex-grow: 1; text-align: center;">
+                SOTA Activation Zones - {region_name}
+            </h3>
+            <button id="toggleSelector" style="padding: 3px 8px; background: #666; color: white; border: none; border-radius: 3px; cursor: pointer; font-weight: bold; font-size: 12px; margin-left: 10px;">
+                −
+            </button>
+        </div>
+        <div id="panelContent">
+            <p style="margin: 0 0 10px 0; font-size: 12px; text-align: center;">
+                <span style="color:blue">● Summits</span> | 
+                <span style="color:red">█ Activation Zones</span><br>
+                <span id="summitCount">{len(summits_gdf)} summits with {len(activation_zones_gdf)} activation zones</span>
+            </p>
+            <div style="margin-bottom: 10px;">
+                <label for="summitFilter" style="font-weight: bold; font-size: 14px;">Filter Summits:</label>
+                <input type="text" id="summitFilter" placeholder="Type to search..." 
+                       style="width: 100%; padding: 5px; margin-top: 5px; border: 1px solid #ccc; border-radius: 3px;">
+            </div>
+            <div style="margin-bottom: 10px;">
+                <label for="summitSelector" style="font-weight: bold; font-size: 14px;">Jump to Summit:</label>
+                <select id="summitSelector" style="width: 100%; padding: 5px; margin-top: 5px; max-height: 200px;">
+                    <option value="">-- Select a Summit --</option>
+                </select>
+            </div>
+            <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+                <button id="prevBtn" style="flex: 1; padding: 5px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;" title="Previous Summit (Ctrl+P)">
+                    ← Prev
+                </button>
+                <button id="nextBtn" style="flex: 1; padding: 5px; background: #28a745; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;" title="Next Summit (Ctrl+N)">
+                    Next →
+                </button>
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <button id="showAllBtn" style="flex: 1; padding: 5px; background: #007cba; color: white; border: none; border-radius: 3px; cursor: pointer;">
+                    Show All
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Summit data (sorted by summit code)
+        var summitData = {json.dumps(sorted(summit_data, key=lambda x: x['code']))};
+        var allOptions = [];
+        var currentSummitIndex = -1;
+        var filteredIndices = [];
+        
+        // Update summit count display
+        function updateSummitCount() {{
+            var withAZ = summitData.filter(s => s.has_az).length;
+            var withoutAZ = summitData.length - withAZ;
+            document.getElementById('summitCount').innerHTML = 
+                summitData.length + ' summits (' + withAZ + ' with AZ, ' + withoutAZ + ' without)';
+        }}
+        
+        // Populate dropdown with all summits
+        function populateSelector(filteredData = null) {{
+            var selector = document.getElementById('summitSelector');
+            var dataToUse = filteredData || summitData;
+            
+            // Clear existing options except first
+            selector.innerHTML = '<option value="">-- Select a Summit --</option>';
+            allOptions = [];
+            filteredIndices = [];
+            
+            dataToUse.forEach(function(summit, originalIndex) {{
+                var globalIndex = summitData.findIndex(s => s.code === summit.code);
+                var option = document.createElement('option');
+                option.value = globalIndex;
+                
+                // Mark summits without activation zones
+                var displayText = summit.code + ': ' + summit.name;
+                if (!summit.has_az) {{
+                    displayText += ' (no AZ)';
+                    option.style.color = '#999';
+                    option.style.fontStyle = 'italic';
+                }}
+                
+                option.text = displayText;
+                selector.appendChild(option);
+                allOptions.push({{
+                    element: option,
+                    summit: summit,
+                    globalIndex: globalIndex
+                }});
+                filteredIndices.push(globalIndex);
+            }});
+        }}
+        
+        // Initial population
+        populateSelector();
+        updateSummitCount();
+        
+        // Filter functionality
+        document.getElementById('summitFilter').addEventListener('input', function() {{
+            var filterText = this.value.toLowerCase();
+            if (filterText === '') {{
+                populateSelector();
+            }} else {{
+                var filtered = summitData.filter(function(summit) {{
+                    return summit.code.toLowerCase().includes(filterText) || 
+                           summit.name.toLowerCase().includes(filterText);
+                }});
+                populateSelector(filtered);
+            }}
+        }});
+        
+        // Function to zoom to summit and its activation zone
+        function zoomToSummit(summitIndex) {{
+            var summit = summitData[summitIndex];
+            if (!summit) return;
+            
+            var map = {m.get_name()};
+            currentSummitIndex = summitIndex;
+            
+            // Update selector to show current summit
+            document.getElementById('summitSelector').value = summitIndex;
+            
+            if (summit.az_bounds) {{
+                // Zoom to activation zone bounds with padding
+                var bounds = summit.az_bounds;
+                var paddingLat = (bounds.maxLat - bounds.minLat) * 0.15;
+                var paddingLon = (bounds.maxLon - bounds.minLon) * 0.15;
+                
+                var fitBounds = [
+                    [bounds.minLat - paddingLat, bounds.minLon - paddingLon],
+                    [bounds.maxLat + paddingLat, bounds.maxLon + paddingLon]
+                ];
+                map.fitBounds(fitBounds);
+            }} else {{
+                // Fallback: center on summit with reasonable zoom
+                map.setView([summit.lat, summit.lon], 16);
+            }}
+        }}
+        
+        // Navigate to next/previous summit
+        function navigateSummit(direction) {{
+            if (filteredIndices.length === 0) return;
+            
+            var currentFilteredIndex = filteredIndices.indexOf(currentSummitIndex);
+            var newFilteredIndex;
+            
+            if (direction === 'next') {{
+                newFilteredIndex = (currentFilteredIndex + 1) % filteredIndices.length;
+            }} else {{
+                newFilteredIndex = currentFilteredIndex <= 0 ? filteredIndices.length - 1 : currentFilteredIndex - 1;
+            }}
+            
+            var newSummitIndex = filteredIndices[newFilteredIndex];
+            zoomToSummit(newSummitIndex);
+        }}
+        
+        // Function to show all summits
+        function showAllSummits() {{
+            var map = {m.get_name()};
+            currentSummitIndex = -1;
+            // Calculate bounds for all summits
+            if (summitData.length > 0) {{
+                var minLat = Math.min(...summitData.map(s => s.lat));
+                var maxLat = Math.max(...summitData.map(s => s.lat));
+                var minLon = Math.min(...summitData.map(s => s.lon));
+                var maxLon = Math.max(...summitData.map(s => s.lon));
+                
+                var bounds = [
+                    [minLat, minLon],
+                    [maxLat, maxLon]
+                ];
+                map.fitBounds(bounds, {{padding: [20, 20]}});
+            }}
+        }}
+        
+        // Toggle selector visibility
+        function toggleSelector() {{
+            var button = document.getElementById('toggleSelector');
+            var content = document.getElementById('panelContent');
+            var panel = document.getElementById('summitPanel');
+            var isCollapsed = content.style.display === 'none';
+            
+            if (isCollapsed) {{
+                content.style.display = 'block';
+                button.textContent = '−';
+                panel.style.width = '320px';
+            }} else {{
+                content.style.display = 'none';
+                button.textContent = '+';
+                panel.style.width = 'auto';
+            }}
+        }}
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(event) {{
+            // Only activate if no input field is focused
+            if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT') {{
+                return;
+            }}
+            
+            if (event.ctrlKey && event.key === 'n') {{
+                event.preventDefault();
+                navigateSummit('next');
+            }} else if (event.ctrlKey && event.key === 'p') {{
+                event.preventDefault();
+                navigateSummit('prev');
+            }}
+        }});
+        
+        // Event listeners
+        document.getElementById('summitSelector').addEventListener('change', function() {{
+            var selectedIndex = this.value;
+            if (selectedIndex !== '') {{
+                zoomToSummit(parseInt(selectedIndex));
+            }}
+        }});
+        
+        document.getElementById('prevBtn').addEventListener('click', function() {{
+            navigateSummit('prev');
+        }});
+        
+        document.getElementById('nextBtn').addEventListener('click', function() {{
+            navigateSummit('next');
+        }});
+        
+        document.getElementById('showAllBtn').addEventListener('click', function() {{
+            showAllSummits();
+            document.getElementById('summitSelector').value = '';
+            document.getElementById('summitFilter').value = '';
+            populateSelector();
+        }});
+        
+        document.getElementById('toggleSelector').addEventListener('click', toggleSelector);
+    </script>
     '''
-    m.get_root().html.add_child(folium.Element(title_html))
+    
+    m.get_root().html.add_child(folium.Element(summit_selector_html))
     
     return m
 
