@@ -130,23 +130,22 @@ def setup_logging(log_file: str, quiet: bool = False):
         console.setFormatter(logging.Formatter(log_format))
         logging.getLogger().addHandler(console)
 
-def setup_directories_from_input_file(summits_file: Path, output_dir: Optional[str] = None):
-    """Setup directory structure based on input file location or specified output directory"""
-    global CACHE_DIR, INPUT_DIR, OUTPUT_DIR
+def setup_directories(output_dir: Optional[str] = None):
+    """Setup directory structure based on optionally specified output directory"""
+    global CACHE_DIR, OUTPUT_DIR
     
     if output_dir:
         # Use specified output directory as base
         base_dir = Path(output_dir)
         logging.info(f"Using specified base directory: {base_dir}")
     else:
-        # Use the directory containing the summit file as base
-        base_dir = summits_file.parent
-        logging.info(f"Using summit file directory as base: {base_dir}")
-    
+        # Use cwd as base
+        base_dir = Path.cwd()
+        logging.info(f"Using current working directory as base: {base_dir}")
+
     # Set up directory paths (no input folder needed)
     CACHE_DIR = base_dir / "cache"
     OUTPUT_DIR = base_dir / "output"
-    INPUT_DIR = None  # Not needed when processing from file
     
     logging.info(f"  Cache: {CACHE_DIR}")
     logging.info(f"  Output: {OUTPUT_DIR}")
@@ -807,13 +806,15 @@ def process_elevation_values(summit: Dict, elevation_data: np.ndarray) -> Tuple[
 def apply_elevation_business_logic(summit: Dict, summit_alt: float, activation_alt: float, 
                                  activation_elevation_raster: float, data_min: float, data_max: float, 
                                  raster_max_az_units: float, elevation_data: np.ndarray, 
-                                 transform: object, crs: object, elevation_tolerance: float) -> Optional[Tuple[float, bool]]:
+                                 transform: object, crs: object, elevation_tolerance: float) -> Tuple[Optional[float], bool, Optional[Dict]]:
     """Apply business logic for elevation validation and AZ calculation
     
-    Returns (final_activation_elevation_raster, needs_larger_radius) or None if validation fails
+    Returns (final_activation_elevation_raster_or_None, needs_larger_radius, raster_data_dict)
+    If validation fails, final_activation_elevation_raster_or_None will be None, but raster_data_dict will still contain the data
     """
     summit_code = summit['summitCode']
     needs_larger_radius = False
+    raster_data = None
     
     if not np.isnan(data_min) and not np.isnan(data_max):
         summit_raster_diff = abs(summit_alt - raster_max_az_units)
@@ -844,14 +845,26 @@ def apply_elevation_business_logic(summit: Dict, summit_alt: float, activation_a
         # Convert to AZ units for display
         coord_distance_display = meters_to_feet(coord_distance_m) if AZ_ELEVATION_UNITS == 'ft' else coord_distance_m
         
+        # Prepare raster data for CSV logging (always, regardless of validation result)
+        raster_data = {
+            'longitude': raster_max_lon_dd,
+            'latitude': raster_max_lat_dd,
+            'elevation_ft': raster_max_az_units if AZ_ELEVATION_UNITS == 'ft' else meters_to_feet(raster_max_az_units),
+            'elevation_m': feet_to_meters(raster_max_az_units) if AZ_ELEVATION_UNITS == 'ft' else raster_max_az_units,
+            'distance_ft': coord_distance_display if AZ_ELEVATION_UNITS == 'ft' else meters_to_feet(coord_distance_m),
+            'distance_m': feet_to_meters(coord_distance_display) if AZ_ELEVATION_UNITS == 'ft' else coord_distance_m,
+            'elevation_diff_ft': summit_raster_diff if AZ_ELEVATION_UNITS == 'ft' else meters_to_feet(summit_raster_diff),
+            'elevation_diff_m': feet_to_meters(summit_raster_diff) if AZ_ELEVATION_UNITS == 'ft' else summit_raster_diff
+        }
+        
         logging.info(f"  Summit elevation ({summit_alt}{AZ_ELEVATION_UNITS}) differs from raster maximum ({raster_max_az_units:.1f}{AZ_ELEVATION_UNITS}) by {summit_raster_diff:.1f}{AZ_ELEVATION_UNITS}")
         logging.info(f"  SOTA coordinates: {sota_x:.6f}, {sota_y:.6f} at elevation ({summit_alt}{AZ_ELEVATION_UNITS})")
         logging.info(f"  Raster high point: {raster_max_lon_dd:.6f}, {raster_max_lat_dd:.6f} at elevation: {data_max:.1f}{RASTER_ELEVATION_UNITS}")
         
-        # Check elevation tolerance
+        # Check elevation tolerance - return raster data even if validation fails
         if summit_raster_diff > elevation_tolerance:
             logging.error(f"  Summit elevation differs from raster maximum by more than tolerance ({elevation_tolerance:.1f}{AZ_ELEVATION_UNITS}) for {summit_code}")
-            return None
+            return None, needs_larger_radius, raster_data  # Return raster data even on validation failure
         
         # Use highest elevation for conservative AZ calculation
         final_activation_elevation = activation_elevation_raster
@@ -866,21 +879,23 @@ def apply_elevation_business_logic(summit: Dict, summit_alt: float, activation_a
             logging.warning(f"  Activation elevation ({final_activation_elevation:.1f}{RASTER_ELEVATION_UNITS}) is below raster minimum - will need larger radius")
             needs_larger_radius = True
         
-        return final_activation_elevation, needs_larger_radius
+        return final_activation_elevation, needs_larger_radius, raster_data
     
-    return activation_elevation_raster, needs_larger_radius
+    return activation_elevation_raster, needs_larger_radius, raster_data
 
-def load_and_validate_elevation_data(elevation_file: Path, summit: Dict, elevation_tolerance: float) -> Optional[Tuple]:
+def load_and_validate_elevation_data(elevation_file: Path, summit: Dict, elevation_tolerance: float) -> Tuple[Optional[Tuple], Optional[Dict]]:
     """Load and validate elevation data from raster file
     
-    Returns (elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius) or None
+    Returns (validation_result, raster_data) where:
+    - validation_result: (elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius) or None if failed
+    - raster_data: Always provided if raster analysis was possible, even if validation failed
     """
     summit_code = summit['summitCode']
     
     # Step 1: Load the raster data
     load_result = load_elevation_data(elevation_file)
     if not load_result:
-        return None
+        return None, None
     
     elevation_data, transform, crs, tiff_bounds = load_result
     
@@ -897,12 +912,14 @@ def load_and_validate_elevation_data(elevation_file: Path, summit: Dict, elevati
         transform, crs, elevation_tolerance
     )
     
-    if business_result is None:
-        return None
+    final_activation_elevation, needs_larger_radius, raster_data = business_result
     
-    final_activation_elevation, needs_larger_radius = business_result
+    # If validation failed (final_activation_elevation is None), return None for validation_result but keep raster_data
+    if final_activation_elevation is None:
+        return None, raster_data
     
-    return elevation_data, transform, crs, tiff_bounds, final_activation_elevation, needs_larger_radius
+    validation_result = (elevation_data, transform, crs, tiff_bounds, final_activation_elevation, needs_larger_radius)
+    return validation_result, raster_data
 
 def create_coordinate_mesh(elevation_data: np.ndarray, transform: object) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create coordinate mesh and clean elevation data for contour generation"""
@@ -1106,7 +1123,7 @@ def calculate_distance_to_edges(contour_coords: List[Tuple[float, float]],
             'shortest': min_dist_overall
         }
     
-def get_tileset_and_process(summit_lon: float, summit_lat: float, radius_multiplier: float, summit: Dict, elevation_tolerance: float) -> Optional[Tuple]:
+def get_tileset_and_process(summit_lon: float, summit_lat: float, radius_multiplier: float, summit: Dict, elevation_tolerance: float) -> Tuple[Optional[Tuple], Optional[Dict]]:
     """Get elevation data for a tileset and process it for activation zone calculation
     
     Args:
@@ -1116,7 +1133,9 @@ def get_tileset_and_process(summit_lon: float, summit_lat: float, radius_multipl
         elevation_tolerance: Elevation tolerance for validation
     
     Returns:
-        (elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius) or None
+        (validation_result, raster_data) where:
+        - validation_result: (elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius) or None if failed
+        - raster_data: Always provided if raster analysis was possible, even if validation failed
     """
     buffer_m = int(TILE_RADIUS_KM * 1000 * radius_multiplier)
     
@@ -1124,14 +1143,11 @@ def get_tileset_and_process(summit_lon: float, summit_lat: float, radius_multipl
     elevation_file = download_elevation_data(summit_lon, summit_lat, buffer_m)
     if not elevation_file:
         logging.error(f"Failed to get elevation data with {radius_multiplier}x radius")
-        return None
+        return None, None
     
     # Load and validate elevation data
-    result = load_and_validate_elevation_data(elevation_file, summit, elevation_tolerance)
-    if not result:
-        return None
-    
-    return result
+    validation_result, raster_data = load_and_validate_elevation_data(elevation_file, summit, elevation_tolerance)
+    return validation_result, raster_data
 
 def process_merged_tileset(elevation_files: List[Path], summit: Dict) -> Optional[Tuple]:
     """Process merged elevation tiles and return processed data
@@ -1255,7 +1271,7 @@ def calculate_contour_with_expansion(elevation_data: np.ndarray, transform: obje
     
     return selected_polygon, boundary_analysis
 
-def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance: float = AZ_ELEVATION_TOLERANCE) -> Optional[Dict]:
+def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance: float = AZ_ELEVATION_TOLERANCE, csv_path: Optional[Path] = None) -> Optional[Dict]:
     """Create activation zone based on actual elevation data
     
     This implements the W7O ARM definition: 'The Activation Zone is a single, "unbroken" area 
@@ -1265,6 +1281,7 @@ def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance: fl
     Args:
         summit: Summit data dictionary
         elevation_tolerance: Tolerance in AZ_ELEVATION_UNITS for validating summit elevation against raster data maximum.
+        csv_path: Optional path to CSV file for logging processing results
     """
     summit_code = summit['summitCode']
     summit_lat = summit['latitude']
@@ -1277,62 +1294,97 @@ def create_activation_zone_elevation_based(summit: Dict, elevation_tolerance: fl
     logging.info(f"  Summit elevation: {summit_alt}{AZ_ELEVATION_UNITS} (from SOTA API)")
     logging.info(f"  Activation zone: {activation_alt}{AZ_ELEVATION_UNITS}")
     
-    # Pass 1: Try with normal 1x radius tileset
-    tileset_result = get_tileset_and_process(summit_lon, summit_lat, 1.0, summit, elevation_tolerance)
-    if not tileset_result:
-        logging.error(f"Failed to get initial elevation data for {summit_code}")
-        return None
+    raster_data = None
+    failure_reason = ""
     
-    elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius = tileset_result
-    
-    # Pass 2: If activation elevation is below minimum, try with 2x radius tileset
-    if needs_larger_radius:
-        logging.info(f"  Retrying with 2x radius due to activation elevation below raster minimum")
-        larger_tileset_result = get_tileset_and_process(summit_lon, summit_lat, 2.0, summit, elevation_tolerance)
-        if larger_tileset_result:
-            larger_elevation_data, larger_transform, larger_crs, larger_tiff_bounds, larger_activation_elevation, still_needs_larger = larger_tileset_result
-            if not still_needs_larger:
-                logging.info(f"  Successfully obtained suitable elevation data with 2x radius")
-                # Use the larger tileset data
-                elevation_data, transform, crs, tiff_bounds, activation_elevation = larger_elevation_data, larger_transform, larger_crs, larger_tiff_bounds, larger_activation_elevation
-            else:
-                logging.error(f"  Activation elevation still below minimum even with 2x radius")
-                return None
-        else:
-            logging.error(f"  Failed to get 2x radius elevation data")
+    try:
+        # Pass 1: Try with normal 1x radius tileset
+        validation_result, raster_data = get_tileset_and_process(summit_lon, summit_lat, 1.0, summit, elevation_tolerance)
+        if validation_result is None:
+            failure_reason = "Failed to get initial elevation data" if raster_data is None else "Elevation validation failed (tolerance exceeded)"
+            logging.error(f"Failed to get initial elevation data for {summit_code}")
+            if csv_path:
+                write_summit_processing_result(csv_path, summit, raster_data, False, failure_reason)
             return None
-    
-    # Pass 3: Calculate contour with automatic tile expansion if needed
-    contour_result = calculate_contour_with_expansion(
-        elevation_data, transform, crs, tiff_bounds, activation_elevation,
-        summit_lon, summit_lat, summit_code, summit
-    )
-    
-    if not contour_result:
+        
+        elevation_data, transform, crs, tiff_bounds, activation_elevation, needs_larger_radius = validation_result
+        
+        # Pass 2: If activation elevation is below minimum, try with 2x radius tileset
+        if needs_larger_radius:
+            logging.info(f"  Retrying with 2x radius due to activation elevation below raster minimum")
+            larger_validation_result, larger_raster_data = get_tileset_and_process(summit_lon, summit_lat, 2.0, summit, elevation_tolerance)
+            if larger_validation_result is not None:
+                larger_elevation_data, larger_transform, larger_crs, larger_tiff_bounds, larger_activation_elevation, still_needs_larger = larger_validation_result
+                if not still_needs_larger:
+                    logging.info(f"  Successfully obtained suitable elevation data with 2x radius")
+                    # Use the larger tileset data
+                    elevation_data, transform, crs, tiff_bounds, activation_elevation = larger_elevation_data, larger_transform, larger_crs, larger_tiff_bounds, larger_activation_elevation
+                    if larger_raster_data:  # Use the raster data from the larger tileset
+                        raster_data = larger_raster_data
+                else:
+                    failure_reason = "Activation elevation still below minimum even with 2x radius"
+                    logging.error(f"  Activation elevation still below minimum even with 2x radius")
+                    if csv_path:
+                        write_summit_processing_result(csv_path, summit, larger_raster_data or raster_data, False, failure_reason)
+                    return None
+            else:
+                failure_reason = "Failed to get 2x radius elevation data" if larger_raster_data is None else "2x radius elevation validation failed (tolerance exceeded)"
+                logging.error(f"  Failed to get 2x radius elevation data")
+                if csv_path:
+                    write_summit_processing_result(csv_path, summit, larger_raster_data or raster_data, False, failure_reason)
+                return None
+        
+        # Pass 3: Calculate contour with automatic tile expansion if needed
+        contour_result = calculate_contour_with_expansion(
+            elevation_data, transform, crs, tiff_bounds, activation_elevation,
+            summit_lon, summit_lat, summit_code, summit
+        )
+        
+        if not contour_result:
+            failure_reason = "Failed to calculate contour or find summit polygon"
+            if csv_path:
+                write_summit_processing_result(csv_path, summit, raster_data, False, failure_reason)
+            return None
+        
+        selected_polygon, boundary_analysis = contour_result
+        
+        # Convert to GeoJSON
+        feature = convert_polygon_to_geojson(selected_polygon, summit_code, str(crs))
+        if not feature:
+            failure_reason = "Failed to convert polygon to GeoJSON"
+            logging.error(f"Failed to convert polygon to GeoJSON for {summit_code}")
+            if csv_path:
+                write_summit_processing_result(csv_path, summit, raster_data, False, failure_reason)
+            return None
+        
+        # Success! Log to CSV
+        if csv_path:
+            write_summit_processing_result(csv_path, summit, raster_data, True, "")
+        
+        logging.info(f"  Successfully created activation zone for {summit_code}")
+        return feature
+        
+    except Exception as e:
+        failure_reason = f"Unexpected error: {str(e)}"
+        logging.error(f"Unexpected error processing {summit_code}: {e}")
+        if csv_path:
+            write_summit_processing_result(csv_path, summit, raster_data, False, failure_reason)
         return None
-    
-    selected_polygon, boundary_analysis = contour_result
-    
-    # Convert to GeoJSON
-    feature = convert_polygon_to_geojson(selected_polygon, summit_code, str(crs))
-    if not feature:
-        logging.error(f"Failed to convert polygon to GeoJSON for {summit_code}")
-        return None
-    
-    logging.info(f"  Successfully created activation zone for {summit_code}")
-    return feature
 
-def process_summit(summit: Dict, elevation_tolerance: float = AZ_ELEVATION_TOLERANCE) -> bool:
+def process_summit(summit: Dict, elevation_tolerance: float, csv_path: Optional[Path] = None) -> bool:
     """Process a single summit and generate activation zone GeoJSON"""
     summit_code = summit['summitCode'].replace('/', '_').replace('-', '_')  # Make filename standard
     output_file = OUTPUT_DIR / f"{summit_code}.geojson" if OUTPUT_DIR is not None else Path(f"{summit_code}.geojson")
-    
+
     # Skip if already processed
     if output_file.exists():
         logging.info(f"Skipping {summit['summitCode']} (already exists)")
+        # Still log to CSV that it was skipped
+        if csv_path:
+            write_summit_processing_result(csv_path, summit, None, True, "Already processed")
         return True
     
-    feature = create_activation_zone_elevation_based(summit, elevation_tolerance)
+    feature = create_activation_zone_elevation_based(summit, elevation_tolerance, csv_path)
     
     if not feature:
         logging.error(f"Failed to process {summit['summitCode']}")
@@ -1353,6 +1405,9 @@ def process_summit(summit: Dict, elevation_tolerance: float = AZ_ELEVATION_TOLER
         
     except Exception as e:
         logging.error(f"Error saving {output_file}: {e}")
+        # Update CSV with file save failure
+        if csv_path:
+            write_summit_processing_result(csv_path, summit, None, False, f"File save error: {str(e)}")
         return False
 
 def parse_arguments():
@@ -1410,6 +1465,12 @@ Examples:
         action='store_true',
         help='Suppress stdout output (logs will still be written to file)'
     )
+    parser.add_argument(
+        '--elevation-tolerance',  # Long: --elevation-tolerance
+        type=float,
+        default=50.0,
+        help='Maximum elevation difference (meters) between SOTA and raster data for validation'
+    )
     
     args = parser.parse_args()
     
@@ -1461,8 +1522,8 @@ def main():
         # Process from existing GeoJSON file
         summits_file = Path(args.summits)
         
-        # Setup directories based on file location or specified output directory
-        setup_directories_from_input_file(summits_file, args.output_dir)
+        # Setup directories based on specified output directory
+        setup_directories(args.output_dir)
         ensure_directories()
         
         logging.info(f"Loading summits from: {summits_file}")
@@ -1505,6 +1566,9 @@ def main():
     logging.info(f"Activation zone height: {AZ_HEIGHT} {AZ_ELEVATION_UNITS}")
     logging.info(f"Elevation tolerance: {args.elevation_tolerance:.1f} {AZ_ELEVATION_UNITS}")
     
+    # Create processing summary CSV file
+    csv_path = create_processing_summary_csv()
+    
     # Process each summit  
     successful = 0
     failed = 0
@@ -1513,7 +1577,7 @@ def main():
     for i, summit in enumerate(summits, 1):
         logging.info(f"*** [{i}/{len(summits)}] {summit['summitCode']}: {summit['name']} ***")
         
-        if process_summit(summit, args.elevation_tolerance):
+        if process_summit(summit, args.elevation_tolerance, csv_path):
             successful += 1
         else:
             failed += 1
@@ -1524,6 +1588,7 @@ def main():
     logging.info(f"Failed: {failed}")
     if OUTPUT_DIR:
         logging.info(f"Output directory: {OUTPUT_DIR.absolute()}")
+    logging.info(f"Processing summary: {csv_path}")
     
     if successful > 0:
         logging.info(f"\nGenerated {successful} activation zone files")
@@ -1533,7 +1598,7 @@ def main():
         logging.warning(f"\n{failed} summits failed processing:")
         for summit_code in failed_summits:
             logging.warning(f"  - {summit_code}")
-        logging.warning(f"\nReview individual summit logs above for specific failure reasons")
+        logging.warning(f"See {csv_path} for detailed failure reasons")
 
 if __name__ == "__main__":
     main()
