@@ -7,8 +7,9 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-from config import SOTA_ASSOCIATION, SOTA_BASE_URL, INPUT_DIR
+import config
 
+SOTA_BASE_URL = "https://api2.sota.org.uk/api"
 
 def fetch_sota_summits(region: str = "NC") -> List[Dict]:
     """
@@ -20,9 +21,7 @@ def fetch_sota_summits(region: str = "NC") -> List[Dict]:
     Returns:
         List of summit dictionaries from SOTA API
     """
-    # SOTA_BASE_URL currently points to regions base: .../api/regions
-    # Full pattern: <base>/<association>/<region>
-    url = f"{SOTA_BASE_URL}/{SOTA_ASSOCIATION}/{region}"
+    url = f"{SOTA_BASE_URL}/regions/{config.SOTA_ASSOCIATION}/{region}"
     
     logging.info(f"Fetching SOTA summits: {url}")
     
@@ -63,13 +62,12 @@ def save_summits_geojson(summits: List[Dict], region: str) -> Path:
     Returns:
         Path to saved GeoJSON file
     """
-    from config import INPUT_DIR, SOTA_ASSOCIATION
-    
+    from config import INPUT_DIR
     if INPUT_DIR is None:
         raise ValueError("INPUT_DIR must be set before saving summits")
     
     # Use new naming convention: <association>_<region>_summits.geojson
-    filename = f"{SOTA_ASSOCIATION}_{region}_summits.geojson"
+    filename = f"{config.SOTA_ASSOCIATION}_{region}_summits.geojson"
     output_file = INPUT_DIR / filename
     
     # Convert summits to GeoJSON format
@@ -196,11 +194,7 @@ def fetch_sota_association_regions(association: str) -> Dict[str, Dict[str, Any]
         Mapping of regionCode -> full region dictionary.
         Returns empty dict on error or unexpected format (logs warnings).
     """
-    # Derive association base by removing trailing '/regions' if present
-    base = SOTA_BASE_URL
-    if base.endswith('/regions'):
-        base = base.rsplit('/regions', 1)[0]
-    url = f"{base}/associations/{association}"
+    url = f"{SOTA_BASE_URL}/associations/{association}"
     logging.info(f"Fetching SOTA association regions: {url}")
     try:
         resp = requests.get(url, timeout=30)

@@ -4,15 +4,14 @@ Configuration constants and global variables for SOTA activation zone processing
 from pathlib import Path
 from typing import Optional
 
-# === PROCESSING CONSTANTS ===
+# === GIS PROCESSING CONSTANTS ===
 TILE_RADIUS = 500  # Initial area radius for each summit in meters
 AZ_HEIGHT = 150  # Activation zone height
 AZ_ELEVATION_TOLERANCE = 20.0  # EL units - if SOTA db elevation differs from raster by more than this, fail the summit
 AZ_ELEVATION_UNITS = "ft"
 
-# === SOTA API CONSTANTS ===
+# === SOTA CONSTANTS ===
 SOTA_ASSOCIATION = "W7O"  # SOTA association code
-SOTA_BASE_URL = "https://api2.sota.org.uk/api/regions"
 
 # === IMAGESERVER CONSTANTS ===
 IMAGESERVER_URL = "https://gis.dogami.oregon.gov/arcgis/rest/services/lidar/DIGITAL_TERRAIN_MODEL_MOSAIC/ImageServer"

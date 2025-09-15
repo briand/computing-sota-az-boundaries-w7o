@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import csv
 import math
 
-from config import SOTA_ASSOCIATION, LOJ_COORD_MATCH_TOLERANCE_M
+from config import LOJ_COORD_MATCH_TOLERANCE_M
 import config as _cfg
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -146,7 +146,7 @@ def discover_loj_file(region: str) -> Optional[Path]:
         return None
 
     region_upper = region.upper()
-    pattern = f"loj_{SOTA_ASSOCIATION}_{region_upper}".lower()  # base pattern, we'll filter manually
+    pattern = f"loj_{_cfg.SOTA_ASSOCIATION}_{region_upper}".lower()  # base pattern, we'll filter manually
 
     candidates: List[Tuple[float, Path]] = []
     try:
@@ -163,7 +163,7 @@ def discover_loj_file(region: str) -> Optional[Path]:
         return None
 
     if not candidates:
-        logging.info(f"No LoJ file found matching pattern 'loj_{SOTA_ASSOCIATION}_{region_upper}*.json'")
+        logging.info(f"No LoJ file found matching pattern 'loj_{_cfg.SOTA_ASSOCIATION}_{region_upper}*.json'")
         return None
 
     # Pick most recently modified
@@ -185,7 +185,7 @@ def discover_loj_csv_file(region: str) -> Optional[Path]:
         return None
 
     region_upper = region.upper()
-    pattern = f"loj_{SOTA_ASSOCIATION}_{region_upper}".lower()
+    pattern = f"loj_{_cfg.SOTA_ASSOCIATION}_{region_upper}".lower()
     candidates: List[Tuple[float, Path]] = []
     try:
         for p in input_dir.glob("*.csv"):
@@ -201,7 +201,7 @@ def discover_loj_csv_file(region: str) -> Optional[Path]:
         return None
 
     if not candidates:
-        logging.info(f"No LoJ CSV file found matching pattern 'loj_{SOTA_ASSOCIATION}_{region_upper}*.csv'")
+        logging.info(f"No LoJ CSV file found matching pattern 'loj_{_cfg.SOTA_ASSOCIATION}_{region_upper}*.csv'")
         return None
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -220,7 +220,7 @@ def discover_loj_csv_association() -> Optional[Path]:
     if input_dir is None:
         logging.error("INPUT_DIR not initialized before association LoJ CSV discovery")
         return None
-    pattern = f"loj_{SOTA_ASSOCIATION}".lower()
+    pattern = f"loj_{_cfg.SOTA_ASSOCIATION}".lower()
     candidates: List[Tuple[float, Path]] = []
     try:
         for p in input_dir.glob("*.csv"):
@@ -253,7 +253,7 @@ def discover_loj_association_file() -> Optional[Path]:
     if input_dir is None:
         logging.error("INPUT_DIR not initialized before association LoJ discovery")
         return None
-    pattern = f"loj_{SOTA_ASSOCIATION}".lower()
+    pattern = f"loj_{_cfg.SOTA_ASSOCIATION}".lower()
     candidates: List[Tuple[float, Path]] = []
     try:
         for p in input_dir.glob("*.json"):

@@ -13,7 +13,7 @@ from collections import defaultdict
 import logging
 import csv
 
-from config import SOTA_ASSOCIATION, LOJ_COORD_MATCH_TOLERANCE_M, POINT_BANDS
+from config import LOJ_COORD_MATCH_TOLERANCE_M, POINT_BANDS
 import config
 from utils import (
     setup_association_directories,
@@ -82,7 +82,7 @@ def names_match(sota_name: str, loj_name: str) -> bool:
 # ---------------- Summit acquisition helpers -----------------
 
 def load_or_fetch_summits(region: str) -> Path:
-    expected_name = f"{SOTA_ASSOCIATION}_{region}_summits.geojson"
+    expected_name = f"{config.SOTA_ASSOCIATION}_{region}_summits.geojson"
     summit_path = (config.INPUT_DIR or Path.cwd() / "input") / expected_name
     if summit_path.exists():
         logging.info(f"Summits file already exists, using cached: {summit_path}")
@@ -93,7 +93,7 @@ def load_or_fetch_summits(region: str) -> Path:
             return summit_path
         except Exception as e:  # noqa: BLE001
             logging.warning(f"Cached summits file load failed ({e}); refetching...")
-    logging.info(f"Fetching SOTA summit list for {SOTA_ASSOCIATION}/{region}")
+    logging.info(f"Fetching SOTA summit list for {config.SOTA_ASSOCIATION}/{region}")
     summits = fetch_sota_summits(region)
     if not summits:
         raise RuntimeError(f"Failed to fetch summits for region {region}")
@@ -246,17 +246,17 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
     setup_logging(log_file, args.quiet)
     logging.info("SOTA vs LoJ Comparison - ALL REGIONS MODE")
     logging.info("=" * 64)
-    logging.info(f"Association: {SOTA_ASSOCIATION}  Mode: ALL REGIONS")
+    logging.info(f"Association: {config.SOTA_ASSOCIATION}  Mode: ALL REGIONS")
     logging.info(f"Log file: {log_file}")
 
-    regions_map = fetch_sota_association_regions(SOTA_ASSOCIATION)
+    regions_map = fetch_sota_association_regions(config.SOTA_ASSOCIATION)
     if not regions_map:
         logging.error("No regions retrieved; aborting.")
         return
     region_codes = sorted(regions_map.keys())
     logging.info(f"Found {len(region_codes)} regions: {', '.join(region_codes)}")
 
-    aggregate_csv = f"loj_compare_{SOTA_ASSOCIATION}_ALL.csv"
+    aggregate_csv = f"loj_compare_{config.SOTA_ASSOCIATION}_ALL.csv"
     aggregate_path = Path(aggregate_csv)
     headers = [
         "sota_summit_code","sota_name","sota_lat","sota_lon","sota_alt_ft","sota_sotlas_uri","match_status",
@@ -298,7 +298,7 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
             all_loj_ids.add(str(lid))
     unmatched_loj_ids = sorted(all_loj_ids - matched_loj_ids)
     if unmatched_loj_ids:
-        unmatched_csv = f"loj_unmatched_{SOTA_ASSOCIATION}_ALL.csv"
+        unmatched_csv = f"loj_unmatched_{config.SOTA_ASSOCIATION}_ALL.csv"
         unmatched_path = Path(unmatched_csv)
         logging.info(f"Writing unmatched LoJ feature list: {unmatched_path} (count={len(unmatched_loj_ids)})")
         with open(unmatched_path, "w", newline="") as fu:
@@ -344,7 +344,7 @@ def run_single_region(args, association_loj_path: Path, loj_features: List[Dict]
     setup_logging(log_file, args.quiet)
     logging.info("SOTA vs LoJ Comparison - SINGLE REGION MODE")
     logging.info("=" * 64)
-    logging.info(f"Association: {SOTA_ASSOCIATION}  Region: {args.region}")
+    logging.info(f"Association: {config.SOTA_ASSOCIATION}  Region: {args.region}")
     logging.info(f"Log file: {log_file}")
 
     summit_file = load_or_fetch_summits(args.region)
@@ -356,7 +356,7 @@ def run_single_region(args, association_loj_path: Path, loj_features: List[Dict]
     logging.info(f"Using association-wide LoJ file: {association_loj_path}")
     logging.info(f"Loaded {len(loj_features)} LoJ features")
 
-    comparison_csv = f"loj_compare_{SOTA_ASSOCIATION}_{args.region}.csv"
+    comparison_csv = f"loj_compare_{config.SOTA_ASSOCIATION}_{args.region}.csv"
     comparison_path = Path(comparison_csv)
     logging.info("")
     logging.info(f"Creating comparison CSV: {comparison_path}")

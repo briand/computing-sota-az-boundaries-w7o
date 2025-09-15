@@ -184,8 +184,8 @@ def main():
 
     # Lazy import of processing + elevation_gis to avoid requiring GIS stack for --fetch-only mode
     try:
-        from processing import create_region_elevation_report_csv, process_summit  # type: ignore
-        from elevation_gis import reset_raster_units  # type: ignore
+        from W7O.gis_processing import create_region_elevation_report_csv, process_summit  # type: ignore
+        from W7O.gis_elevation import reset_raster_units  # type: ignore
     except ModuleNotFoundError as e:
         logging.error("Required GIS libraries are missing for processing mode: %s", e)
         logging.error("Install rasterio, shapely, matplotlib, scikit-image before processing activation zones.")

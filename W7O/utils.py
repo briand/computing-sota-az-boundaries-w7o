@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import config
-from config import SOTA_ASSOCIATION
 
 __all__ = [
     "generate_log_filename",
@@ -37,7 +36,7 @@ def generate_log_filename(region: Optional[str] = None, summits_file: Optional[P
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     if region:
-        return f"{prefix}_{SOTA_ASSOCIATION}_{region}_{timestamp}.txt"
+        return f"{prefix}_{config.SOTA_ASSOCIATION}_{region}_{timestamp}.txt"
     if summits_file:
         return f"{prefix}_{summits_file.stem}_{timestamp}.txt"
     return f"{prefix}_{timestamp}.txt"
@@ -66,7 +65,7 @@ def setup_association_directories(region: str):
     base_dir = Path.cwd()
     config.CACHE_DIR = base_dir / "cache"
     config.INPUT_DIR = base_dir / "input"
-    config.OUTPUT_DIR = base_dir / f"{SOTA_ASSOCIATION}_{region}"
+    config.OUTPUT_DIR = base_dir / f"{config.SOTA_ASSOCIATION}_{region}"
     config.CURRENT_REGION = region
     logging.debug(
         "Configured directories -> CACHE: %s INPUT: %s OUTPUT: %s", 
@@ -84,8 +83,8 @@ def extract_region_from_filename(filepath: Path) -> str:
     if len(parts) < 3 or parts[-1] != 'summits':
         raise ValueError("Summit filename must follow pattern '<association>_<region>_summits.geojson'")
     association = parts[0]
-    if association != SOTA_ASSOCIATION:
-        raise ValueError(f"Summit file association '{association}' doesn't match expected '{SOTA_ASSOCIATION}'")
+    if association != config.SOTA_ASSOCIATION:
+        raise ValueError(f"Summit file association '{association}' doesn't match expected '{config.SOTA_ASSOCIATION}'")
     region = '_'.join(parts[1:-1])
     return region
 

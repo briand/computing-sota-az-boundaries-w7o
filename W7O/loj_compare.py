@@ -3,6 +3,7 @@ Main entry point for SOTA - Lists of John compare processing.
 Handles argument parsing, logging setup, and directory management.
 """
 import argparse
+import config
 from loj_processing import run as run_processing
 
 
@@ -25,6 +26,10 @@ Examples:
         help="SOTA region code (e.g., NC, LC)"
     )
     parser.add_argument(
+        "-a", "--association",
+        required=False,
+        help="Override SOTA association code (e.g., W7O, W7W). Defaults to current config value.")
+    parser.add_argument(
         "--all-regions",
         action="store_true",
         help="Process all regions for the association (overrides --region)"
@@ -45,6 +50,9 @@ Examples:
 
 def main():
     args = parse_arguments()
+    # Apply association override early so downstream modules referencing config see updated value
+    if args.association:
+        config.SOTA_ASSOCIATION = args.association.upper()
     run_processing(args)
 
 
