@@ -17,6 +17,7 @@ from config import LOJ_COORD_MATCH_TOLERANCE_M, POINT_BANDS
 import config
 from utils import (
     setup_association_directories,
+    setup_basic_io_directories,
     ensure_directories,
     setup_logging,
     generate_log_filename,
@@ -52,10 +53,12 @@ def _normalize_name(raw: str) -> str:
 def names_match(sota_name: str, loj_name: str) -> bool:
     """Return True if names considered equivalent.
 
-    Rules:
-      1. Exact normalized equality (strip quotes, alnum lowercase).
-      2. Special Mount swap: "Mount X" (SOTA order) == "X Mount" (LoJ order).
-      3. High point suffix: "Foo HP" (SOTA) == "Foo" (LoJ) when remaining tokens match.
+        Rules:
+            1. Exact normalized equality (strip quotes, alnum lowercase).
+            2. Special Mount swap: "Mount X" (SOTA order) == "X Mount" (LoJ order).
+            3. High point suffix: "Foo HP" (SOTA) == "Foo" (LoJ) when remaining tokens match.
+            4. Cardinal swap: leading cardinal (north,south,east,west,etc) in SOTA allowed to appear trailing in LoJ ("West Bald" == "Bald West").
+            5. Definite article swap: leading 'The' in SOTA can appear trailing in LoJ ("The Temple" == "Temple The").
     """
     if not sota_name or not loj_name:
         return False
@@ -63,9 +66,10 @@ def names_match(sota_name: str, loj_name: str) -> bool:
     n_loj = _normalize_name(loj_name)
     if n_sota and n_sota == n_loj:
         return True
-    # Mount swap check
+    # Token lists (retain original ordering for swap rules)
     sota_tokens = [t for t in sota_name.replace('"','').split() if t]
     loj_tokens = [t for t in loj_name.replace('"','').split() if t]
+    # Mount swap check
     if len(sota_tokens) >= 2 and len(loj_tokens) == len(sota_tokens):
         if sota_tokens[0].lower() == 'mount' and loj_tokens[-1].lower() == 'mount':
             sota_core = ' '.join(sota_tokens[1:])
@@ -77,7 +81,42 @@ def names_match(sota_name: str, loj_name: str) -> bool:
     if len(sota_tokens) == len(loj_tokens) + 1 and sota_tokens[-1].lower() == 'hp':
         if _normalize_name(' '.join(sota_tokens[:-1])) == _normalize_name(' '.join(loj_tokens)):
             return True
+    # Cardinal swap: if SOTA starts with cardinal and LoJ ends with same cardinal and cores match
+    cardinals = {"north","south","east","west","n","s","e","w"}
+    if len(sota_tokens) >= 2 and len(loj_tokens) == len(sota_tokens):
+        if sota_tokens[0].lower() in cardinals and loj_tokens[-1].lower() == sota_tokens[0].lower():
+            if _normalize_name(' '.join(sota_tokens[1:])) == _normalize_name(' '.join(loj_tokens[:-1])):
+                return True
+    # 'The' swap: leading 'The' in SOTA can trail in LoJ
+    if len(sota_tokens) >= 2 and len(loj_tokens) == len(sota_tokens):
+        if sota_tokens[0].lower() == 'the' and loj_tokens[-1].lower() == 'the':
+            if _normalize_name(' '.join(sota_tokens[1:])) == _normalize_name(' '.join(loj_tokens[:-1])):
+                return True
     return False
+
+def is_vanity_name(sota_name: str, loj_name: str) -> bool:
+    """Return True if this should be flagged as a vanity numeric name.
+
+    Criteria:
+      - SOTA name begins with a purely numeric token (e.g., '5434').
+      - SOTA name has additional tokens containing at least one alphabetic character (so not just another number).
+      - LoJ name is exactly that numeric token (after normalization) and nothing more (purely numeric).
+      - If SOTA name is ONLY the number (no extra tokens), this is NOT vanity; it's a normal match.
+    """
+    if not sota_name or not loj_name:
+        return False
+    tokens = [t for t in sota_name.split() if t]
+    if not tokens or not tokens[0].isdigit():
+        return False
+    if len(tokens) == 1:  # Pure numeric only, treat as normal
+        return False
+    remainder = ' '.join(tokens[1:])
+    if not any(ch.isalpha() for ch in remainder):
+        return False
+    loj_norm = _normalize_name(loj_name)
+    if not loj_norm.isdigit():
+        return False
+    return loj_norm == tokens[0]
 
 # ---------------- Summit acquisition helpers -----------------
 
@@ -123,7 +162,7 @@ def load_association_loj(explicit: Optional[str]) -> tuple[Path, List[Dict]]:
 
 # ---------------- Region processing -----------------
 
-def process_single_region(region: str, writer, loj_features: List[Dict]) -> tuple[int, int, Set[str], Dict[str, List[Tuple[str, float]]]]:
+def process_single_region(region: str, writer, loj_features: List[Dict]) -> tuple[int, int, int, int, Set[str], Dict[str, List[Tuple[str, float]]]]:
     summit_file = load_or_fetch_summits(region)
     sota_summits = load_summits_from_geojson(summit_file)
     sota_active = [s for s in sota_summits if is_summit_valid(s)]
@@ -131,6 +170,8 @@ def process_single_region(region: str, writer, loj_features: List[Dict]) -> tupl
 
     matches = 0
     unmatched = 0
+    name_mismatch_count = 0
+    name_vanity_count = 0
     matched_loj_ids: Set[str] = set()
     # Map of LoJ id -> list of (SOTA summit code, distance_m) for UNMATCHED_NEAREST cases referencing that LoJ peak
     nearest_reference_map: DefaultDict[str, List[Tuple[str, float]]] = defaultdict(list)
@@ -207,6 +248,8 @@ def process_single_region(region: str, writer, loj_features: List[Dict]) -> tupl
         loj_clean = _norm(loj_name)  # retained for potential future diagnostics
         name_equal = names_match(summit.get("name") or "", loj_name)
         status = "MATCH" if name_equal else "NAME_MISMATCH"
+        if status in ("MATCH", "NAME_MISMATCH") and is_vanity_name(summit.get("name") or "", loj_name):
+            status = "NAME_VANITY"
         # Band crossing check (only for matched coordinate pairs, regardless of name mismatch)
         # If summit_alt_ft and loj_alt_ft straddle any POINT_BANDS threshold, escalate status.
         try:
@@ -221,6 +264,10 @@ def process_single_region(region: str, writer, loj_features: List[Dict]) -> tupl
                         break
         except Exception:
             pass
+        if status == "NAME_MISMATCH":
+            name_mismatch_count += 1
+        elif status == "NAME_VANITY":
+            name_vanity_count += 1
         writer.writerow([
             summit_code, summit.get("name"), lat, lon, summit_alt_ft,
             sotlas_uri,
@@ -233,14 +280,15 @@ def process_single_region(region: str, writer, loj_features: List[Dict]) -> tupl
         matches += 1
         if loj_id:
             matched_loj_ids.add(str(loj_id))
-    logging.info(f"Region {region} done: matches={matches} unmatched={unmatched}")
-    return matches, unmatched, matched_loj_ids, nearest_reference_map
+    logging.info(f"Region {region} done: matches={matches} unmatched={unmatched} name_mismatch={name_mismatch_count} name_vanity={name_vanity_count}")
+    return matches, unmatched, name_mismatch_count, name_vanity_count, matched_loj_ids, nearest_reference_map
 
 # ---------------- All regions -----------------
 
 def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
     pseudo_region = "ALL"
-    setup_association_directories(pseudo_region)
+    # Only need cache/input directories; comparison outputs are single CSVs in cwd
+    setup_basic_io_directories()
     ensure_directories()
     log_file = generate_log_filename(pseudo_region)
     setup_logging(log_file, args.quiet)
@@ -264,6 +312,8 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
     ]
     total_matches = 0
     total_unmatched = 0
+    total_name_mismatch = 0
+    total_name_vanity = 0
     regions_processed = 0
     matched_loj_ids: Set[str] = set()
     # Aggregate of nearest references across regions
@@ -273,13 +323,16 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
         writer.writerow(headers)
         for rcode in region_codes:
             try:
-                setup_association_directories(rcode)
-                ensure_directories()
+                # No per-region output directory creation for comparison runs
+                pass
                 logging.info("")
                 logging.info(f"=== Region {rcode} ===")
-                region_matches, region_unmatched, region_matched_ids, region_nearest_refs = process_single_region(rcode, writer, loj_features)
+                (region_matches, region_unmatched, region_name_mismatch, region_name_vanity,
+                 region_matched_ids, region_nearest_refs) = process_single_region(rcode, writer, loj_features)
                 total_matches += region_matches
                 total_unmatched += region_unmatched
+                total_name_mismatch += region_name_mismatch
+                total_name_vanity += region_name_vanity
                 matched_loj_ids.update(region_matched_ids)
                 for lid, refs in region_nearest_refs.items():
                     aggregated_nearest_refs[lid].extend(refs)
@@ -287,7 +340,7 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
             except Exception as e:  # noqa: BLE001
                 logging.error(f"Region {rcode} failed: {e}")
     logging.info("")
-    logging.info(f"ALL REGIONS COMPLETE: regions={regions_processed} matches={total_matches} unmatched={total_unmatched}")
+    logging.info(f"ALL REGIONS COMPLETE: regions={regions_processed} matches={total_matches} unmatched={total_unmatched} name_mismatch={total_name_mismatch} name_vanity={total_name_vanity}")
     logging.info(f"Aggregate CSV: {aggregate_path}")
     logging.info(f"Association-wide LoJ file: {association_loj_path}")
 
@@ -338,7 +391,7 @@ def run_all_regions(args, association_loj_path: Path, loj_features: List[Dict]):
 # ---------------- Single region -----------------
 
 def run_single_region(args, association_loj_path: Path, loj_features: List[Dict]):
-    setup_association_directories(args.region)
+    setup_basic_io_directories()
     ensure_directories()
     log_file = generate_log_filename(args.region)
     setup_logging(log_file, args.quiet)
@@ -462,6 +515,8 @@ def run_single_region(args, association_loj_path: Path, loj_features: List[Dict]
             loj_clean = _norm(loj_name)  # retained for potential future diagnostics
             name_equal = names_match(summit.get("name") or "", loj_name)
             status = "MATCH" if name_equal else "NAME_MISMATCH"
+            if status in ("MATCH", "NAME_MISMATCH") and is_vanity_name(summit.get("name") or "", loj_name):
+                status = "NAME_VANITY"
             try:
                 if isinstance(summit_alt_ft, (int, float)) and isinstance(loj_alt_ft, (int, float)):
                     s_alt = float(summit_alt_ft)
@@ -498,10 +553,8 @@ def run(args):
         raise SystemExit("Must specify either --region or --all-regions")
 
     # Pre-create base directory structure to allow LoJ discovery
-    if args.all_regions:
-        setup_association_directories("ALL")
-    else:
-        setup_association_directories(args.region)
+    # For comparison runs, avoid creating region output directories
+    setup_basic_io_directories()
     ensure_directories()
 
     association_loj_path, loj_features = load_association_loj(args.loj_file)

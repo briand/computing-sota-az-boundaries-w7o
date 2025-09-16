@@ -21,6 +21,7 @@ __all__ = [
     "generate_log_filename",
     "setup_logging",
     "setup_association_directories",
+    "setup_basic_io_directories",
     "extract_region_from_filename",
     "ensure_directories",
 ]
@@ -70,6 +71,21 @@ def setup_association_directories(region: str):
     logging.debug(
         "Configured directories -> CACHE: %s INPUT: %s OUTPUT: %s", 
         config.CACHE_DIR, config.INPUT_DIR, config.OUTPUT_DIR
+    )
+
+def setup_basic_io_directories():
+    """Setup only cache/input directories for comparison scripts that should not create per-region output dirs.
+
+    Leaves OUTPUT_DIR as None so ensure_directories won't create region folders.
+    """
+    base_dir = Path.cwd()
+    config.CACHE_DIR = base_dir / "cache"
+    config.INPUT_DIR = base_dir / "input"
+    config.OUTPUT_DIR = None
+    config.CURRENT_REGION = None
+    logging.debug(
+        "Configured basic IO directories -> CACHE: %s INPUT: %s (no OUTPUT_DIR)",
+        config.CACHE_DIR, config.INPUT_DIR
     )
 
 
